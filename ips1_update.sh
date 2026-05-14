@@ -103,7 +103,7 @@ echo "Checking current IPS1 installation..."
 [ -f "$INSTALL_DIR/ips1.cfg" ] || fail "$INSTALL_DIR/ips1.cfg is missing. Run ips1_install.sh first."
 [ -f "$INSTALL_DIR/credentials.cfg" ] || fail "$INSTALL_DIR/credentials.cfg is missing. Run ips1_install.sh first."
 grep -q '^GATEWAY_URL=' "$INSTALL_DIR/credentials.cfg" || \
-	fail "credentials.cfg is from an older agent (no GATEWAY_URL). Re-run ips1_install.sh with IPS1_GATEWAY_URL and IPS1_ENROLL_CODE."
+	fail "credentials.cfg is missing GATEWAY_URL. Re-run ips1_install.sh with IPS1_GATEWAY_URL and IPS1_ENROLL_CODE."
 echo "... done."
 
 CURRENT_VERSION="$(read_version "$INSTALL_DIR/ips1_agent.sh")"

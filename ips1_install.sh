@@ -27,14 +27,19 @@ GITHUB_REPO="IPS1/novacloud-agent-monitoring"
 # Branch
 BRANCH="main"
 
-# Gateway enrollment parameters (passed in via environment from the IPS1 dashboard install command).
-# Customer servers do NOT hold InfluxDB credentials. They hold a refresh token scoped to one SID,
-# and exchange it at the gateway for short-lived access JWTs used on every metric write.
-echo "Validating gateway enrollment parameters from environment..."
+fetch_file() {   # fetch_file <url> <dest>
+	if command -v wget >/dev/null 2>&1; then
+		wget -t 1 -T 30 -qO "$2" "$1"
+	else
+		curl -fsSL --max-time 30 -o "$2" "$1"
+	fi
+}
+
+# Validate gateway parameters from environment
+echo "Validating gateway parameters from environment..."
 for var in IPS1_GATEWAY_URL IPS1_ENROLL_CODE; do
 	if [ -z "${!var}" ]; then
 		echo "ERROR: environment variable $var is not set."
-		echo "Obtain the full install command from the IPS1 customer dashboard."
 		exit 1
 	fi
 done
@@ -65,10 +70,11 @@ if [ -z "$2" ]
 	exit
 fi
 
-# Check if system has crontab and wget
-echo "Checking for crontab and wget..."
-command -v crontab >/dev/null 2>&1 || { echo "ERROR: Crontab is required to run this agent." >&2; exit 1; }
-command -v wget >/dev/null 2>&1 || { echo "ERROR: wget is required to run this agent." >&2; exit 1; }
+# Check if system has crontab and a download tool
+echo "Checking for crontab and a download tool (wget or curl)..."
+command -v crontab >/dev/null 2>&1 || { echo "ERROR: crontab is required to run this agent." >&2; exit 1; }
+{ command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; } \
+	|| { echo "ERROR: wget or curl is required to run this agent." >&2; exit 1; }
 echo "... done."
 
 # Remove old agent (if exists)
@@ -89,16 +95,16 @@ echo "... done."
 
 # Fetching the agent
 echo "Fetching the agent..."
-wget -t 1 -T 30 -qO /etc/ips1/ips1_agent.sh https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1_agent.sh
+fetch_file "https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1_agent.sh" /etc/ips1/ips1_agent.sh
 echo "... done."
 
 # Fetching the config file
 echo "Fetching the config file..."
-wget -t 1 -T 30 -qO /etc/ips1/ips1.cfg https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1.cfg
+fetch_file "https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1.cfg" /etc/ips1/ips1.cfg
 echo "... done."
 
 echo "Fetching the updater..."
-wget -t 1 -T 30 -qO /etc/ips1/ips1_update.sh https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1_update.sh
+fetch_file "https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1_update.sh" /etc/ips1/ips1_update.sh
 echo "... done."
 
 # Strip Windows line endings (CRLF → LF) if present
@@ -108,48 +114,33 @@ sed -i 's/\r$//' /etc/ips1/ips1.cfg
 sed -i 's/\r$//' /etc/ips1/ips1_update.sh
 echo "... done."
 
-# Inserting Server ID (SID) and gateway URL into the agent config
-echo "Inserting Server ID (SID) and gateway URL into agent config..."
+# Inserting Server ID (SID) into the agent config
+echo "Inserting Server ID (SID) into agent config..."
 sed -i "s/SID=\"\"/SID=\"$SID\"/" /etc/ips1/ips1.cfg
-GATEWAY_URL_ESCAPED=$(printf '%s\n' "$IPS1_GATEWAY_URL" | sed 's/[\/&|]/\\&/g')
-sed -i "s|GatewayURL=\"\"|GatewayURL=\"$GATEWAY_URL_ESCAPED\"|" /etc/ips1/ips1.cfg
 echo "... done."
 
-# Redeem the one-time enrollment code at the gateway to get a refresh token + initial access JWT.
-# The dashboard generates the code; it is single-use and short-lived (15 min).
+# Enroll this server at the gateway to obtain a server-scoped token.
+# The gateway holds all InfluxDB credentials — they never reach the customer VM.
 echo "Enrolling server at $IPS1_GATEWAY_URL..."
-ENROLL_PAYLOAD="{\"sid\":\"$SID\",\"code\":\"$IPS1_ENROLL_CODE\"}"
 ENROLL_RESPONSE=$(curl -fsS --max-time 30 -XPOST "$IPS1_GATEWAY_URL/v1/enroll" \
 	-H "Content-Type: application/json" \
-	-d "$ENROLL_PAYLOAD") || {
-	echo "ERROR: enrollment request to $IPS1_GATEWAY_URL/v1/enroll failed." >&2
-	echo "Check that IPS1_GATEWAY_URL is reachable and IPS1_ENROLL_CODE is still valid." >&2
+	-d "{\"sid\":\"$SID\",\"code\":\"$IPS1_ENROLL_CODE\"}") || {
+	echo "ERROR: enrollment request failed. Check IPS1_GATEWAY_URL and IPS1_ENROLL_CODE." >&2
 	exit 1
 }
-
-REFRESH_TOKEN=$(printf '%s' "$ENROLL_RESPONSE" | sed -n 's/.*"refresh_token":"\([^"]*\)".*/\1/p')
-ACCESS_TOKEN=$(printf '%s'  "$ENROLL_RESPONSE" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
-ACCESS_TTL=$(printf '%s'    "$ENROLL_RESPONSE" | sed -n 's/.*"access_expires_in":\([0-9]*\).*/\1/p')
-
-if [ -z "$REFRESH_TOKEN" ] || [ -z "$ACCESS_TOKEN" ] || [ -z "$ACCESS_TTL" ]; then
-	echo "ERROR: gateway enrollment response did not contain the expected fields." >&2
-	echo "Response was: $ENROLL_RESPONSE" >&2
+SERVER_TOKEN=$(printf '%s' "$ENROLL_RESPONSE" | sed -n 's/.*"server_token":"\([^"]*\)".*/\1/p')
+if [ -z "$SERVER_TOKEN" ]; then
+	echo "ERROR: gateway did not return a server_token. Response: $ENROLL_RESPONSE" >&2
 	exit 1
 fi
-
-# Subtract a 60s skew buffer so we refresh slightly before the JWT actually expires.
-ACCESS_EXPIRES_AT=$(( $(date +%s) + ACCESS_TTL - 60 ))
 echo "... done."
 
-# Writing gateway credentials to a separate file (mode 600, kept out of the repo).
-# Only the per-server refresh token is durable; the access JWT is rewritten on every refresh.
+# Write gateway credentials (mode 600 — never committed to git).
 echo "Writing gateway credentials to /etc/ips1/credentials.cfg..."
 umask 077
 cat > /etc/ips1/credentials.cfg <<EOF
 GATEWAY_URL="$IPS1_GATEWAY_URL"
-REFRESH_TOKEN="$REFRESH_TOKEN"
-ACCESS_TOKEN="$ACCESS_TOKEN"
-ACCESS_EXPIRES_AT="$ACCESS_EXPIRES_AT"
+SERVER_TOKEN="$SERVER_TOKEN"
 EOF
 chmod 600 /etc/ips1/credentials.cfg
 umask 022
@@ -247,9 +238,9 @@ echo "... done."
 
 # Cleaning up install file
 echo "Cleaning up the installation file..."
-if [ -f $0 ]
-then
-    rm -f $0
+# Only remove when $0 is an actual file on disk (not a pipe/process-substitution run)
+if [ -f "$0" ]; then
+	rm -f "$0"
 fi
 echo "... done."
 

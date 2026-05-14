@@ -42,8 +42,7 @@ else
 fi
 
 # Load gateway credentials (written by the installer, never committed to git).
-# These hold a per-server refresh token + cached short-lived access JWT. InfluxDB credentials
-# never reach the customer machine — the gateway forwards writes using server-side credentials.
+# InfluxDB credentials are held by the gateway — they never appear on customer VMs.
 if [ -f "$ScriptPath"/credentials.cfg ]
 then
 	. "$ScriptPath"/credentials.cfg
@@ -52,37 +51,11 @@ else
 	exit 1
 fi
 
-if [ -z "$GATEWAY_URL" ] || [ -z "$REFRESH_TOKEN" ]
+if [ -z "$GATEWAY_URL" ] || [ -z "$SERVER_TOKEN" ]
 then
-	echo "ERROR: credentials.cfg is missing GATEWAY_URL or REFRESH_TOKEN. Re-run the installer." >&2
+	echo "ERROR: credentials.cfg is missing GATEWAY_URL or SERVER_TOKEN. Re-run the installer." >&2
 	exit 1
 fi
-ACCESS_TOKEN=${ACCESS_TOKEN:-}
-ACCESS_EXPIRES_AT=${ACCESS_EXPIRES_AT:-0}
-
-# Refresh the short-lived access JWT at the gateway. Writes the new token + absolute expiry
-# back to credentials.cfg so the next cron tick can reuse it. Returns 0 on success, 1 on failure.
-refresh_access_token() {
-	local resp ttl now
-	resp=$(curl -fsS --max-time 10 -XPOST "$GATEWAY_URL/v1/refresh" \
-		-H "Content-Type: application/json" \
-		-d "{\"refresh_token\":\"$REFRESH_TOKEN\"}" 2>>"$ScriptPath"/debug.log) || return 1
-	ACCESS_TOKEN=$(printf '%s' "$resp" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
-	ttl=$(printf '%s' "$resp" | sed -n 's/.*"access_expires_in":\([0-9]*\).*/\1/p')
-	[ -n "$ACCESS_TOKEN" ] && [ -n "$ttl" ] || return 1
-	now=$(date +%s)
-	ACCESS_EXPIRES_AT=$(( now + ttl - 60 ))
-	umask 077
-	cat > "$ScriptPath/credentials.cfg.tmp" <<EOF
-GATEWAY_URL="$GATEWAY_URL"
-REFRESH_TOKEN="$REFRESH_TOKEN"
-ACCESS_TOKEN="$ACCESS_TOKEN"
-ACCESS_EXPIRES_AT="$ACCESS_EXPIRES_AT"
-EOF
-	mv "$ScriptPath/credentials.cfg.tmp" "$ScriptPath/credentials.cfg"
-	umask 022
-	return 0
-}
 
 # Script start time
 ScriptStartTime=$(date +[%Y-%m-%d\ %T)
@@ -1142,42 +1115,19 @@ done
 echo "InfluxDB Line Protocol Payload (timestamp=$TIMESTAMP):"
 echo "$LINES"
 
-# Ensure we have a fresh-enough access token before posting. If refresh fails we drop this
-# sample and exit cleanly — the next cron tick will try again. No on-disk queue by design.
-NOW_TS=$(date +%s)
-if [ -z "$ACCESS_TOKEN" ] || [ "$NOW_TS" -ge "$ACCESS_EXPIRES_AT" ]; then
-  if ! refresh_access_token; then
-    echo "ERROR: failed to refresh access token at $GATEWAY_URL/v1/refresh; dropping this sample."
-    if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Token refresh failed, dropping sample" >> "$ScriptPath"/debug.log; fi
-    exit 0
-  fi
-fi
-
-# Send line protocol to the gateway. The gateway verifies the JWT, looks up the bucket/org
-# bound to this SID, and forwards to InfluxDB using server-side credentials.
+# Send line protocol to the IPS1 gateway. The gateway authenticates the SERVER_TOKEN,
+# resolves the SID, and forwards to InfluxDB using its own credentials.
 GW_HTTP_CODE=$(curl -s -o /tmp/ips1_gw_response.txt -w "%{http_code}" --max-time 15 \
-  -XPOST "$GATEWAY_URL/v1/metrics?sid=$SID" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: text/plain" \
+  -XPOST "$GATEWAY_URL/v1/write" \
+  -H "Authorization: Bearer $SERVER_TOKEN" \
+  -H "Content-Type: text/plain; charset=utf-8" \
   --data-binary "$LINES")
 
 if [ "$GW_HTTP_CODE" = "204" ]; then
   echo "Metrics accepted by gateway."
 elif [ "$GW_HTTP_CODE" = "401" ]; then
-  # Gateway rejected the JWT (likely revoked or signing-key rotation). Clear the cached token
-  # so the next tick performs a fresh refresh. If the refresh token itself was revoked,
-  # /v1/refresh will keep failing and the operator must re-run the installer.
-  echo "ERROR: gateway returned 401; clearing access token so next run refreshes."
-  if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Gateway 401, blanking access token" >> "$ScriptPath"/debug.log; fi
-  umask 077
-  cat > "$ScriptPath/credentials.cfg.tmp" <<EOF
-GATEWAY_URL="$GATEWAY_URL"
-REFRESH_TOKEN="$REFRESH_TOKEN"
-ACCESS_TOKEN=""
-ACCESS_EXPIRES_AT="0"
-EOF
-  mv "$ScriptPath/credentials.cfg.tmp" "$ScriptPath/credentials.cfg"
-  umask 022
+  echo "ERROR: gateway rejected SERVER_TOKEN (401). Re-run the installer to re-enroll."
+  if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Gateway 401, token rejected" >> "$ScriptPath"/debug.log; fi
 else
   echo "ERROR: gateway returned HTTP $GW_HTTP_CODE: $(cat /tmp/ips1_gw_response.txt)"
   if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Gateway HTTP $GW_HTTP_CODE: $(cat /tmp/ips1_gw_response.txt)" >> "$ScriptPath"/debug.log; fi
