@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+*.md text eol=lf
+*.go text eol=lf
+*.sql text eol=lf

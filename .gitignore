@@ -1,0 +1,8 @@
+#AI
+.claude/
+CLAUDE.md
+AGENT.md
+
+docs/
+gateway/deploy/config.env
+gateway/ips1-gateway
