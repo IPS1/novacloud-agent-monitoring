@@ -107,6 +107,12 @@ echo "Fetching the updater..."
 fetch_file "https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1_update.sh" /etc/ips1/ips1_update.sh
 echo "... done."
 
+# Fetch the credential loader binary (pre-built, salt embedded at release time)
+echo "Fetching ips1-creds..."
+fetch_file "https://github.com/$GITHUB_REPO/releases/latest/download/ips1-creds-linux-amd64" /usr/local/bin/ips1-creds
+chmod 711 /usr/local/bin/ips1-creds
+echo "... done."
+
 # Strip Windows line endings (CRLF → LF) if present
 echo "Ensuring Unix (LF) line endings..."
 sed -i 's/\r$//' /etc/ips1/ips1_agent.sh
@@ -130,19 +136,18 @@ if [ -z "$SERVER_TOKEN" ]; then
 fi
 echo "... done."
 
-# Write system credentials (mode 600 — never committed to git, not customer-editable).
-# SID is stored here so it lives alongside SERVER_TOKEN and is treated as a system
-# identity rather than a user-configurable setting. The gateway also enforces the
-# canonical SID server-side, so editing this file cannot corrupt InfluxDB data.
-echo "Writing system credentials to /etc/ips1/credentials.cfg..."
-umask 077
-cat > /etc/ips1/credentials.cfg <<EOF
-GATEWAY_URL="$IPS1_GATEWAY_URL"
-SERVER_TOKEN="$SERVER_TOKEN"
-SID="$SID"
-EOF
-chmod 600 /etc/ips1/credentials.cfg
-umask 022
+# Seal credentials into an AES-256-GCM encrypted store bound to this machine's
+# hardware identity (/etc/machine-id). No plaintext credential file is written.
+# The gateway also enforces the canonical SID server-side, so the encrypted SID
+# cannot be tampered with to corrupt InfluxDB data.
+echo "Sealing credentials..."
+ips1-creds seal \
+	--gateway "$IPS1_GATEWAY_URL" \
+	--token   "$SERVER_TOKEN" \
+	--sid     "$SID" || {
+	echo "ERROR: credential sealing failed. Make sure ips1-creds is installed and /etc/machine-id exists." >&2
+	exit 1
+}
 echo "... done."
 
 # Check if any services are to be monitored

@@ -41,19 +41,18 @@ else
 	exit 1
 fi
 
-# Load gateway credentials (written by the installer, never committed to git).
-# InfluxDB credentials are held by the gateway — they never appear on customer VMs.
-if [ -f "$ScriptPath"/credentials.cfg ]
-then
-	. "$ScriptPath"/credentials.cfg
-else
-	echo "ERROR: $ScriptPath/credentials.cfg not found. Re-run the installer to recreate it." >&2
+# Load gateway credentials from the AES-256-GCM encrypted store.
+# ips1-creds decrypts using a key derived from this machine's /etc/machine-id —
+# the blob is unreadable on any other host even if copied.
+creds=$(ips1-creds reveal 2>&1) || {
+	echo "ERROR: could not decrypt credential store. Re-run the installer to recreate it." >&2
 	exit 1
-fi
+}
+eval "$creds"
 
 if [ -z "$GATEWAY_URL" ] || [ -z "$SERVER_TOKEN" ]
 then
-	echo "ERROR: credentials.cfg is missing GATEWAY_URL or SERVER_TOKEN. Re-run the installer." >&2
+	echo "ERROR: credential store is missing GATEWAY_URL or SERVER_TOKEN. Re-run the installer." >&2
 	exit 1
 fi
 
