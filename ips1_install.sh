@@ -114,11 +114,6 @@ sed -i 's/\r$//' /etc/ips1/ips1.cfg
 sed -i 's/\r$//' /etc/ips1/ips1_update.sh
 echo "... done."
 
-# Inserting Server ID (SID) into the agent config
-echo "Inserting Server ID (SID) into agent config..."
-sed -i "s/SID=\"\"/SID=\"$SID\"/" /etc/ips1/ips1.cfg
-echo "... done."
-
 # Enroll this server at the gateway to obtain a server-scoped token.
 # The gateway holds all InfluxDB credentials — they never reach the customer VM.
 echo "Enrolling server at $IPS1_GATEWAY_URL..."
@@ -135,12 +130,16 @@ if [ -z "$SERVER_TOKEN" ]; then
 fi
 echo "... done."
 
-# Write gateway credentials (mode 600 — never committed to git).
-echo "Writing gateway credentials to /etc/ips1/credentials.cfg..."
+# Write system credentials (mode 600 — never committed to git, not customer-editable).
+# SID is stored here so it lives alongside SERVER_TOKEN and is treated as a system
+# identity rather than a user-configurable setting. The gateway also enforces the
+# canonical SID server-side, so editing this file cannot corrupt InfluxDB data.
+echo "Writing system credentials to /etc/ips1/credentials.cfg..."
 umask 077
 cat > /etc/ips1/credentials.cfg <<EOF
 GATEWAY_URL="$IPS1_GATEWAY_URL"
 SERVER_TOKEN="$SERVER_TOKEN"
+SID="$SID"
 EOF
 chmod 600 /etc/ips1/credentials.cfg
 umask 022
