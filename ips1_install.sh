@@ -109,7 +109,7 @@ echo "... done."
 
 # Fetch the credential loader binary (pre-built, salt embedded at release time)
 echo "Fetching ips1-creds..."
-fetch_file "https://github.com/$GITHUB_REPO/releases/latest/download/ips1-creds-linux-amd64" /usr/local/bin/ips1-creds
+fetch_file "http://agapi.stg5.ips1cloud.com/downloads/ips1-creds-linux-amd64" /usr/local/bin/ips1-creds
 chmod 711 /usr/local/bin/ips1-creds
 echo "... done."
 
