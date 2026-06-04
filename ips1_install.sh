@@ -110,6 +110,10 @@ echo "... done."
 # Fetch the credential loader binary (pre-built, salt embedded at release time)
 echo "Fetching ips1-creds..."
 fetch_file "http://agapi.stg5.ips1cloud.com/downloads/ips1-creds-linux-amd64" /usr/local/bin/ips1-creds
+if [ ! -s /usr/local/bin/ips1-creds ]; then
+	echo "ERROR: ips1-creds download failed or produced an empty file. Check that the gateway server is reachable." >&2
+	exit 1
+fi
 chmod 711 /usr/local/bin/ips1-creds
 echo "... done."
 
