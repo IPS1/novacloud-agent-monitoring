@@ -53,28 +53,15 @@ if [ "$EUID" -ne 0 ]
 fi
 echo "... done."
 
-# Detect Server Unique ID — priority order:
-#   1. IPS1_SID env var (manual override)
-#   2. OpenStack instance metadata endpoint
-#   3. /etc/machine-id (fallback for non-OpenStack VMs)
+# Detect Server Unique ID from OpenStack instance metadata.
 echo "Detecting Server ID (SID)..."
-if [ -n "$IPS1_SID" ]; then
-	SID=$IPS1_SID
-	echo "Using manually supplied SID: $SID"
-else
-	SID=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json 2>/dev/null \
-		| sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
-	if [ -n "$SID" ]; then
-		echo "Auto-detected OpenStack instance UUID: $SID"
-	elif [ -f /etc/machine-id ]; then
-		SID=$(cat /etc/machine-id)
-		echo "Falling back to machine-id: $SID"
-	fi
-fi
+SID=$(curl -v --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json \
+	| sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
 if [ -z "$SID" ]; then
-	echo "ERROR: Could not detect SID. Set IPS1_SID env var to provide one manually." >&2
+	echo "ERROR: Could not detect SID. Metadata endpoint unreachable." >&2
 	exit 1
 fi
+echo "Auto-detected OpenStack instance UUID: $SID"
 echo "... done."
 
 # Check if user has selected to run agent as 'root' or as 'ips1' user
