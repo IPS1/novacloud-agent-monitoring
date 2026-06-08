@@ -53,20 +53,28 @@ if [ "$EUID" -ne 0 ]
 fi
 echo "... done."
 
-# Fetch Server Unique ID
-SID=$1
-
-# Make sure SID is not empty
-echo "Checking Server ID (SID)..."
-if [ -z "$SID" ]
-	then echo "ERROR: First parameter missing."
-	exit
+# Detect Server Unique ID from OpenStack instance metadata.
+# IPS1_SID env var can override for non-OpenStack environments.
+echo "Detecting Server ID (SID)..."
+if [ -n "$IPS1_SID" ]; then
+	SID=$IPS1_SID
+	echo "Using manually supplied SID: $SID"
+else
+	SID=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json 2>/dev/null \
+		| sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+	if [ -n "$SID" ]; then
+		echo "Auto-detected OpenStack instance UUID: $SID"
+	fi
+fi
+if [ -z "$SID" ]; then
+	echo "ERROR: Could not detect SID. Metadata endpoint unreachable and IPS1_SID is not set." >&2
+	exit 1
 fi
 echo "... done."
 
 # Check if user has selected to run agent as 'root' or as 'ips1' user
-if [ -z "$2" ]
-	then echo "ERROR: Second parameter missing."
+if [ -z "$1" ]
+	then echo "ERROR: First parameter (RunAsRoot) missing."
 	exit
 fi
 
@@ -109,7 +117,7 @@ echo "... done."
 
 # Fetch the credential loader binary (pre-built, salt embedded at release time)
 echo "Fetching ips1-creds..."
-fetch_file "http://agapi.stg5.ips1cloud.com/downloads/ips1-creds-linux-amd64" /usr/local/bin/ips1-creds
+fetch_file "$IPS1_GATEWAY_URL/downloads/ips1-creds-linux-amd64" /usr/local/bin/ips1-creds
 if [ ! -s /usr/local/bin/ips1-creds ]; then
 	echo "ERROR: ips1-creds download failed or produced an empty file. Check that the gateway server is reachable." >&2
 	exit 1
@@ -156,16 +164,16 @@ echo "... done."
 
 # Check if any services are to be monitored
 echo "Checking if any services should be monitored..."
-if [ "$3" != "0" ]
+if [ "$2" != "0" ]
 then
 	echo "Services found, inserting them into the agent config..."
-	sed -i "s/CheckServices=\"\"/CheckServices=\"$3\"/" /etc/ips1/ips1.cfg
+	sed -i "s/CheckServices=\"\"/CheckServices=\"$2\"/" /etc/ips1/ips1.cfg
 fi
 echo "... done."
 
 # Check if software RAID should be monitored
 echo "Checking if software RAID should be monitored..."
-if [ "$4" -eq "1" ]
+if [ "$3" -eq "1" ]
 then
 	echo "Enabling software RAID monitoring in the agent config..."
 	sed -i "s/CheckSoftRAID=0/CheckSoftRAID=1/" /etc/ips1/ips1.cfg
@@ -174,7 +182,7 @@ echo "... done."
 
 # Check if Drive Health should be monitored
 echo "Checking if Drive Health should be monitored..."
-if [ "$5" -eq "1" ]
+if [ "$4" -eq "1" ]
 then
 	echo "Enabling Drive Health monitoring in the agent config..."
 	sed -i "s/CheckDriveHealth=0/CheckDriveHealth=1/" /etc/ips1/ips1.cfg
@@ -183,7 +191,7 @@ echo "... done."
 
 # Check if 'View running processes' should be enabled
 echo "Checking if 'View running processes' should be enabled..."
-if [ "$6" -eq "1" ]
+if [ "$5" -eq "1" ]
 then
 	echo "Enabling 'View running processes' in the agent config..."
 	sed -i "s/RunningProcesses=0/RunningProcesses=1/" /etc/ips1/ips1.cfg
@@ -192,10 +200,10 @@ echo "... done."
 
 # Check if any ports to monitor number of connections on
 echo "Checking if any ports to monitor number of connections on..."
-if [ "$7" != "0" ]
+if [ "$6" != "0" ]
 then
 	echo "Ports found, inserting them into the agent config..."
-	sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$7\"/" /etc/ips1/ips1.cfg
+	sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$6\"/" /etc/ips1/ips1.cfg
 fi
 echo "... done."
 
@@ -234,7 +242,7 @@ echo "... done."
 
 # Setup the new cronjob to run the agent either as 'root' or as 'ips1' user, depending on client's installation choice.
 # Default is running the agent as 'ips1' user, unless chosen otherwise by the client when fetching the installation code from the ips1 website.
-if [ "$2" -eq "1" ]
+if [ "$1" -eq "1" ]
 then
 	echo "Setting up the new cronjob as 'root' user..."
 	crontab -u root -l 2>/dev/null | { cat; echo "* * * * * bash /etc/ips1/ips1_agent.sh >> /etc/ips1/ips1_cron.log 2>&1"; } | crontab -u root - >/dev/null 2>&1
@@ -260,7 +268,7 @@ echo "... done."
 #echo "... done."
 
 # Start the agent
-if [ "$2" -eq "1" ]
+if [ "$1" -eq "1" ]
 then
 	echo "Starting the agent under the 'root' user..."
 	bash /etc/ips1/ips1_agent.sh > /dev/null 2>&1 &
