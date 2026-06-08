@@ -101,9 +101,7 @@ echo "... done."
 echo "Checking current IPS1 installation..."
 [ -d "$INSTALL_DIR" ] || fail "$INSTALL_DIR does not exist. Run ips1_install.sh first."
 [ -f "$INSTALL_DIR/ips1.cfg" ] || fail "$INSTALL_DIR/ips1.cfg is missing. Run ips1_install.sh first."
-[ -f "$INSTALL_DIR/credentials.cfg" ] || fail "$INSTALL_DIR/credentials.cfg is missing. Run ips1_install.sh first."
-grep -q '^GATEWAY_URL=' "$INSTALL_DIR/credentials.cfg" || \
-	fail "credentials.cfg is missing GATEWAY_URL. Re-run ips1_install.sh with IPS1_GATEWAY_URL and IPS1_ENROLL_CODE."
+[ -f "$INSTALL_DIR/.d" ] || fail "$INSTALL_DIR/.d credential store is missing. Run ips1_install.sh first."
 echo "... done."
 
 CURRENT_VERSION="$(read_version "$INSTALL_DIR/ips1_agent.sh")"
@@ -143,7 +141,7 @@ cp "$TMP_DIR/ips1_agent.sh" "$INSTALL_DIR/ips1_agent.sh" || fail "Failed to inst
 cp "$TMP_DIR/ips1_update.sh" "$INSTALL_DIR/ips1_update.sh" || fail "Failed to install ips1_update.sh."
 merge_missing_config_keys "$TMP_DIR/ips1.cfg" "$INSTALL_DIR/ips1.cfg"
 chmod 700 "$INSTALL_DIR/ips1_agent.sh" "$INSTALL_DIR/ips1_update.sh"
-chmod 600 "$INSTALL_DIR/credentials.cfg"
+chmod 600 "$INSTALL_DIR/.d"
 if command -v chown >/dev/null 2>&1; then
 	chown --reference="$INSTALL_DIR" "$INSTALL_DIR/ips1_agent.sh" "$INSTALL_DIR/ips1_update.sh" "$INSTALL_DIR/ips1.cfg" 2>/dev/null || true
 fi

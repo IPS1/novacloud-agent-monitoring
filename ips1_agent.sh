@@ -42,14 +42,14 @@ else
 fi
 
 # Load gateway credentials from the AES-256-GCM encrypted store.
-# ips1-creds decrypts using a key derived from this machine's /etc/machine-id —
+# creds decrypts using a key derived from this machine's /etc/machine-id —
 # the blob is unreadable on any other host even if copied.
-creds=$(ips1-creds reveal 2>&1) || {
+creds=$(/usr/local/bin/creds reveal 2>&1) || {
 	echo "ERROR: could not decrypt credential store. Re-run the installer to recreate it." >&2
 	exit 1
 }
 if [ -z "$creds" ]; then
-	echo "ERROR: ips1-creds reveal produced no output — binary may be invalid or missing. Re-run the installer." >&2
+	echo "ERROR: creds reveal produced no output — binary may be invalid or missing. Re-run the installer." >&2
 	exit 1
 fi
 eval "$creds"

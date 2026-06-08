@@ -116,13 +116,13 @@ fetch_file "https://raw.githubusercontent.com/$GITHUB_REPO/$BRANCH/ips1_update.s
 echo "... done."
 
 # Fetch the credential loader binary (pre-built, salt embedded at release time)
-echo "Fetching ips1-creds..."
-fetch_file "$IPS1_GATEWAY_URL/downloads/ips1-creds-linux-amd64" /usr/local/bin/ips1-creds
-if [ ! -s /usr/local/bin/ips1-creds ]; then
-	echo "ERROR: ips1-creds download failed or produced an empty file. Check that the gateway server is reachable." >&2
+echo "Fetching creds..."
+fetch_file "$IPS1_GATEWAY_URL/downloads/creds-linux-amd64" /usr/local/bin/creds
+if [ ! -s /usr/local/bin/creds ]; then
+	echo "ERROR: creds download failed or produced an empty file. Check that the gateway server is reachable." >&2
 	exit 1
 fi
-chmod 711 /usr/local/bin/ips1-creds
+chmod 711 /usr/local/bin/creds
 echo "... done."
 
 # Strip Windows line endings (CRLF → LF) if present
@@ -153,11 +153,11 @@ echo "... done."
 # The gateway also enforces the canonical SID server-side, so the encrypted SID
 # cannot be tampered with to corrupt InfluxDB data.
 echo "Sealing credentials..."
-ips1-creds seal \
+creds seal \
 	--gateway "$IPS1_GATEWAY_URL" \
 	--token   "$SERVER_TOKEN" \
 	--sid     "$SID" || {
-	echo "ERROR: credential sealing failed. Make sure ips1-creds is installed and /etc/machine-id exists." >&2
+	echo "ERROR: credential sealing failed. Make sure creds is installed and /etc/machine-id exists." >&2
 	exit 1
 }
 echo "... done."
