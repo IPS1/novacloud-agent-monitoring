@@ -53,8 +53,10 @@ if [ "$EUID" -ne 0 ]
 fi
 echo "... done."
 
-# Detect Server Unique ID from OpenStack instance metadata.
-# IPS1_SID env var can override for non-OpenStack environments.
+# Detect Server Unique ID — priority order:
+#   1. IPS1_SID env var (manual override)
+#   2. OpenStack instance metadata endpoint
+#   3. /etc/machine-id (fallback for non-OpenStack VMs)
 echo "Detecting Server ID (SID)..."
 if [ -n "$IPS1_SID" ]; then
 	SID=$IPS1_SID
@@ -64,10 +66,13 @@ else
 		| sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
 	if [ -n "$SID" ]; then
 		echo "Auto-detected OpenStack instance UUID: $SID"
+	elif [ -f /etc/machine-id ]; then
+		SID=$(cat /etc/machine-id)
+		echo "Falling back to machine-id: $SID"
 	fi
 fi
 if [ -z "$SID" ]; then
-	echo "ERROR: Could not detect SID. Metadata endpoint unreachable and IPS1_SID is not set." >&2
+	echo "ERROR: Could not detect SID. Set IPS1_SID env var to provide one manually." >&2
 	exit 1
 fi
 echo "... done."
