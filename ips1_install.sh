@@ -226,22 +226,52 @@ else
 fi
 echo "... done."
 
-# Removing old cronjob (if exists)
+# Removing any old ips1 cronjob (if exists from prior installs)
 echo "Removing any old ips1 cronjob, if exists..."
-crontab -u root -l | grep -v 'ips1_agent.sh'  | crontab -u root - >/dev/null 2>&1
-crontab -u ips1 -l | grep -v 'ips1_agent.sh'  | crontab -u ips1 - >/dev/null 2>&1
+crontab -u root -l 2>/dev/null | grep -v 'ips1_agent.sh' | crontab -u root - >/dev/null 2>&1
+crontab -u ips1  -l 2>/dev/null | grep -v 'ips1_agent.sh' | crontab -u ips1  - >/dev/null 2>&1
 echo "... done."
 
-# Setup the new cronjob to run the agent either as 'root' or as 'ips1' user, depending on client's installation choice.
-# Default is running the agent as 'ips1' user, unless chosen otherwise by the client when fetching the installation code from the ips1 website.
-if [ "$1" -eq "1" ]
-then
-	echo "Setting up the new cronjob as 'root' user..."
-	crontab -u root -l 2>/dev/null | { cat; echo "* * * * * bash /etc/ips1/ips1_agent.sh >> /etc/ips1/ips1_cron.log 2>&1"; } | crontab -u root - >/dev/null 2>&1
-else
-	echo "Setting up the new cronjob as 'ips1' user..."
-	crontab -u ips1 -l 2>/dev/null | { cat; echo "* * * * * bash /etc/ips1/ips1_agent.sh >> /etc/ips1/ips1_cron.log 2>&1"; } | crontab -u ips1 - >/dev/null 2>&1
+# Install systemd service + timer
+echo "Installing systemd service and timer..."
+SYSTEMD_SERVICE_USER="ips1"
+if [ "$1" -eq "1" ]; then
+	SYSTEMD_SERVICE_USER="root"
 fi
+
+cat > /etc/systemd/system/ips1-agent.service <<EOF
+[Unit]
+Description=IPS1 Monitoring Agent (single run)
+After=network.target
+
+[Service]
+Type=oneshot
+User=${SYSTEMD_SERVICE_USER}
+ExecStart=/bin/bash /etc/ips1/ips1_agent.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/ips1-agent.timer <<EOF
+[Unit]
+Description=IPS1 Monitoring Agent - run every minute
+Requires=ips1-agent.service
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ips1-agent.timer
+systemctl start ips1-agent.service
 echo "... done."
 
 # Cleaning up install file
@@ -259,16 +289,7 @@ echo "... done."
 #wget -t 1 -T 30 -qO- --post-data "$POST" https://sm.ips1.net/ &> /dev/null
 #echo "... done."
 
-# Start the agent
-if [ "$1" -eq "1" ]
-then
-	echo "Starting the agent under the 'root' user..."
-	bash /etc/ips1/ips1_agent.sh > /dev/null 2>&1 &
-else
-	echo "Starting the agent under the 'ips1' user..."
-	sudo -u ips1 bash /etc/ips1/ips1_agent.sh > /dev/null 2>&1 &
-fi
-echo "... done."
+# Agent is started by systemctl above via ips1-agent.service
 
 # All done
 echo "IPS1 agent installation completed."

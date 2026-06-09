@@ -72,25 +72,25 @@ merge_missing_config_keys() {
 }
 
 stop_running_agents() {
-	local pids pid
-
-	pids=$(pgrep -f "$INSTALL_DIR/ips1_agent.sh" 2>/dev/null || true)
-	if [ -z "$pids" ]; then
-		return
+	# Stop via systemd first if the service is currently running
+	if systemctl is-active --quiet ips1-agent.service 2>/dev/null; then
+		systemctl stop ips1-agent.service 2>/dev/null || true
+		sleep 1
 	fi
 
+	# Fallback: kill any stray processes not managed by systemd
+	local pids pid
+	pids=$(pgrep -f "$INSTALL_DIR/ips1_agent.sh" 2>/dev/null || true)
+	[ -z "$pids" ] && return
+
 	for pid in $pids; do
-		if [ "$pid" != "$$" ]; then
-			kill "$pid" 2>/dev/null || true
-		fi
+		[ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
 	done
 
 	sleep 2
 
 	for pid in $pids; do
-		if kill -0 "$pid" 2>/dev/null; then
-			kill -9 "$pid" 2>/dev/null || true
-		fi
+		kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
 	done
 }
 
@@ -147,13 +147,13 @@ if command -v chown >/dev/null 2>&1; then
 fi
 echo "... done."
 
-echo "Checking cron configuration..."
-if crontab -u root -l 2>/dev/null | grep -q "$INSTALL_DIR/ips1_agent.sh"; then
-	echo "Cron entry found for root."
-elif id -u ips1 >/dev/null 2>&1 && crontab -u ips1 -l 2>/dev/null | grep -q "$INSTALL_DIR/ips1_agent.sh"; then
-	echo "Cron entry found for ips1."
+echo "Checking systemd timer configuration..."
+if systemctl is-active --quiet ips1-agent.timer 2>/dev/null; then
+	echo "ips1-agent.timer is active."
+	systemctl daemon-reload
+	systemctl restart ips1-agent.timer
 else
-	echo "WARNING: No IPS1 cron entry found. The agent was updated, but scheduled execution may not be configured."
+	echo "WARNING: ips1-agent.timer is not active. Run ips1_install.sh to reconfigure scheduling."
 fi
 echo "... done."
 
