@@ -41,23 +41,51 @@ else
 	exit 1
 fi
 
-# Load gateway credentials from the AES-256-GCM encrypted store.
-# creds decrypts using a key derived from this machine's /etc/machine-id —
-# the blob is unreadable on any other host even if copied.
-creds=$(/usr/local/bin/creds reveal 2>&1) || {
-	echo "ERROR: could not decrypt credential store. Re-run the installer to recreate it." >&2
-	exit 1
-}
-if [ -z "$creds" ]; then
-	echo "ERROR: creds reveal produced no output — binary may be invalid or missing. Re-run the installer." >&2
-	exit 1
+# Load gateway credentials from the AES-256-GCM encrypted store. creds decrypts
+# using a key derived from this machine's /etc/machine-id — the blob is unreadable
+# on any other host even if copied. On a freshly installed host the store does
+# not exist yet; that is expected and handled by the self-enrollment step below.
+creds=$(/usr/local/bin/creds reveal 2>/dev/null)
+if [ -n "$creds" ]; then
+	eval "$creds"
 fi
-eval "$creds"
 
+# First-run self-enrollment: if this host has no sealed token yet, prove its
+# OpenStack identity (instance uuid + project_id, read from the metadata service)
+# to the gateway. The (uuid, project_id) pair must have been pre-authorized via
+# POST /v1/admin/authorize-sid. On success we seal the returned token and
+# continue this run; otherwise we exit 0 so the next timer tick retries — this
+# removes any race with the provisioning backend authorizing the SID.
 if [ -z "$GATEWAY_URL" ] || [ -z "$SERVER_TOKEN" ]
 then
-	echo "ERROR: credential store is missing GATEWAY_URL or SERVER_TOKEN. Re-run the installer." >&2
-	exit 1
+	GATEWAY_URL=$(tr -d '\r\n ' < "$ScriptPath"/gateway.url 2>/dev/null)
+	if [ -z "$GATEWAY_URL" ]; then
+		echo "ERROR: not enrolled and $ScriptPath/gateway.url is missing. Re-run the installer." >&2
+		exit 1
+	fi
+	META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
+	SID=$(printf '%s' "$META" | sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
+	PROJECT_ID=$(printf '%s' "$META" | sed -n 's/.*"project_id": *"\([^"]*\)".*/\1/p')
+	if [ -z "$SID" ] || [ -z "$PROJECT_ID" ]; then
+		echo "ERROR: could not read uuid/project_id from OpenStack metadata; cannot enroll." >&2
+		exit 1
+	fi
+	ENROLL_RESPONSE=$(curl -fsS --max-time 30 -XPOST "$GATEWAY_URL/v1/enroll" \
+		-H "Content-Type: application/json" \
+		-d "{\"sid\":\"$SID\",\"project_id\":\"$PROJECT_ID\"}") || {
+		echo "Not yet authorized to enroll SID $SID (gateway rejected). Will retry next run." >&2
+		exit 0
+	}
+	SERVER_TOKEN=$(printf '%s' "$ENROLL_RESPONSE" | sed -n 's/.*"server_token":"\([^"]*\)".*/\1/p')
+	if [ -z "$SERVER_TOKEN" ]; then
+		echo "ERROR: gateway returned no server_token. Response: $ENROLL_RESPONSE" >&2
+		exit 0
+	fi
+	/usr/local/bin/creds seal --gateway "$GATEWAY_URL" --token "$SERVER_TOKEN" --sid "$SID" || {
+		echo "ERROR: failed to seal credentials after enrollment." >&2
+		exit 1
+	}
+	echo "IPS1 agent enrolled successfully (SID=$SID)."
 fi
 
 # Script start time

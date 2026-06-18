@@ -37,7 +37,7 @@ fetch_file() {   # fetch_file <url> <dest>
 
 # Validate gateway parameters from environment
 echo "Validating gateway parameters from environment..."
-for var in IPS1_GATEWAY_URL IPS1_ENROLL_CODE; do
+for var in IPS1_GATEWAY_URL; do
 	if [ -z "${!var}" ]; then
 		echo "ERROR: environment variable $var is not set."
 		exit 1
@@ -51,17 +51,6 @@ if [ "$EUID" -ne 0 ]
   then echo "ERROR: Please run the install script as root."
   exit
 fi
-echo "... done."
-
-# Detect Server Unique ID from OpenStack instance metadata.
-echo "Detecting Server ID (SID)..."
-SID=$(curl -v --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json \
-	| sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
-if [ -z "$SID" ]; then
-	echo "ERROR: Could not detect SID. Metadata endpoint unreachable." >&2
-	exit 1
-fi
-echo "Auto-detected OpenStack instance UUID: $SID"
 echo "... done."
 
 # Check if user has selected to run agent as 'root' or as 'ips1' user
@@ -124,34 +113,15 @@ sed -i 's/\r$//' /etc/ips1/ips1.cfg
 sed -i 's/\r$//' /etc/ips1/ips1_update.sh
 echo "... done."
 
-# Enroll this server at the gateway to obtain a server-scoped token.
-# The gateway holds all InfluxDB credentials — they never reach the customer VM.
-echo "Enrolling server at $IPS1_GATEWAY_URL..."
-ENROLL_RESPONSE=$(curl -fsS --max-time 30 -XPOST "$IPS1_GATEWAY_URL/v1/enroll" \
-	-H "Content-Type: application/json" \
-	-d "{\"sid\":\"$SID\",\"code\":\"$IPS1_ENROLL_CODE\"}") || {
-	echo "ERROR: enrollment request failed. Check IPS1_GATEWAY_URL and IPS1_ENROLL_CODE." >&2
-	exit 1
-}
-SERVER_TOKEN=$(printf '%s' "$ENROLL_RESPONSE" | sed -n 's/.*"server_token":"\([^"]*\)".*/\1/p')
-if [ -z "$SERVER_TOKEN" ]; then
-	echo "ERROR: gateway did not return a server_token. Response: $ENROLL_RESPONSE" >&2
-	exit 1
-fi
-echo "... done."
-
-# Seal credentials into an AES-256-GCM encrypted store bound to this machine's
-# hardware identity (/etc/machine-id). No plaintext credential file is written.
-# The gateway also enforces the canonical SID server-side, so the encrypted SID
-# cannot be tampered with to corrupt InfluxDB data.
-echo "Sealing credentials..."
-creds seal \
-	--gateway "$IPS1_GATEWAY_URL" \
-	--token   "$SERVER_TOKEN" \
-	--sid     "$SID" || {
-	echo "ERROR: credential sealing failed. Make sure creds is installed and /etc/machine-id exists." >&2
-	exit 1
-}
+# Record the gateway URL for the agent's first-run self-enrollment.
+# Enrollment no longer happens here: on its first timer tick the agent proves
+# this instance's OpenStack identity (uuid + project_id, read from the metadata
+# service) to the gateway, receives a server-scoped token, and seals it into
+# /etc/ips1/.d (AES-256-GCM, bound to /etc/machine-id). The gateway holds all
+# InfluxDB credentials — they never reach the customer VM, and no enrollment
+# secret is baked into this install.
+echo "Recording gateway URL for agent self-enrollment..."
+printf '%s\n' "$IPS1_GATEWAY_URL" > /etc/ips1/gateway.url
 echo "... done."
 
 # Check if any services are to be monitored
@@ -271,6 +241,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now ips1-agent.timer
+systemctl enable --now ips1-agent.service
 systemctl start ips1-agent.service
 echo "... done."
 
@@ -281,15 +252,6 @@ if [ -f "$0" ]; then
 	rm -f "$0"
 fi
 echo "... done."
-
-# Let IPS1 platform know install has been completed
-# TODO: re-enable once backend coverage exists for this endpoint
-#echo "Letting IPS1 platform know the installation has been completed..."
-#POST="v=install&s=$SID"
-#wget -t 1 -T 30 -qO- --post-data "$POST" https://sm.ips1.net/ &> /dev/null
-#echo "... done."
-
-# Agent is started by systemctl above via ips1-agent.service
 
 # All done
 echo "IPS1 agent installation completed."
