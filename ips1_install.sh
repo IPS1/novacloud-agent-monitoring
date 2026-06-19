@@ -134,27 +134,13 @@ then
 fi
 echo "... done."
 
-# Check if software RAID should be monitored
-echo "Checking if software RAID should be monitored..."
-if [ "$3" -eq "1" ]
-then
-	echo "Enabling software RAID monitoring in the agent config..."
-	sed -i "s/CheckSoftRAID=0/CheckSoftRAID=1/" /etc/ips1/ips1.cfg
-fi
-echo "... done."
-
-# Check if Drive Health should be monitored
-echo "Checking if Drive Health should be monitored..."
-if [ "$4" -eq "1" ]
-then
-	echo "Enabling Drive Health monitoring in the agent config..."
-	sed -i "s/CheckDriveHealth=0/CheckDriveHealth=1/" /etc/ips1/ips1.cfg
-fi
-echo "... done."
+# NOTE: software RAID (CheckSoftRAID) and Drive Health (CheckDriveHealth) are not
+# offered to customers. They stay OFF (0) in ips1.cfg and are intentionally not
+# wired to any install argument.
 
 # Check if 'View running processes' should be enabled
 echo "Checking if 'View running processes' should be enabled..."
-if [ "$5" -eq "1" ]
+if [ "$3" -eq "1" ]
 then
 	echo "Enabling 'View running processes' in the agent config..."
 	sed -i "s/RunningProcesses=0/RunningProcesses=1/" /etc/ips1/ips1.cfg
@@ -163,10 +149,10 @@ echo "... done."
 
 # Check if any ports to monitor number of connections on
 echo "Checking if any ports to monitor number of connections on..."
-if [ "$6" != "0" ]
+if [ "$4" != "0" ]
 then
 	echo "Ports found, inserting them into the agent config..."
-	sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$6\"/" /etc/ips1/ips1.cfg
+	sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$4\"/" /etc/ips1/ips1.cfg
 fi
 echo "... done."
 
