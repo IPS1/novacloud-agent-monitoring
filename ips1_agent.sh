@@ -58,9 +58,9 @@ fi
 # removes any race with the provisioning backend authorizing the SID.
 if [ -z "$GATEWAY_URL" ] || [ -z "$SERVER_TOKEN" ]
 then
-	GATEWAY_URL=$(tr -d '\r\n ' < "$ScriptPath"/gateway.url 2>/dev/null)
+	# GATEWAY_URL is sourced from ips1.cfg above (the installer writes it there).
 	if [ -z "$GATEWAY_URL" ]; then
-		echo "ERROR: not enrolled and $ScriptPath/gateway.url is missing. Re-run the installer." >&2
+		echo "ERROR: not enrolled and GATEWAY_URL is not set in ips1.cfg. Re-run the installer." >&2
 		exit 1
 	fi
 	META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
@@ -85,6 +85,12 @@ then
 		echo "ERROR: failed to seal credentials after enrollment." >&2
 		exit 1
 	}
+	# The gateway URL and token are now sealed into the encrypted, machine-bound
+	# credential store, which is authoritative from here on (loaded via `creds
+	# reveal` at the top of every run). Blank the plaintext GATEWAY_URL out of
+	# ips1.cfg so it no longer appears in any on-disk config file. This run keeps
+	# using the in-memory $GATEWAY_URL; subsequent runs get it from the store.
+	sed -i 's|^GATEWAY_URL=.*|GATEWAY_URL=""|' "$ScriptPath"/ips1.cfg 2>/dev/null || true
 	echo "IPS1 agent enrolled successfully (SID=$SID)."
 fi
 
