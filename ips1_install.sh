@@ -114,13 +114,6 @@ sed -i 's/\r$//' /etc/ips1/ips1_update.sh
 echo "... done."
 
 # Record the gateway URL in the agent config for first-run self-enrollment.
-# Enrollment no longer happens here: on its first timer tick the agent proves
-# this instance's OpenStack identity (uuid + project_id, read from the metadata
-# service) to the gateway, receives a server-scoped token, and seals it into
-# /etc/ips1/.d (AES-256-GCM, bound to /etc/machine-id). The gateway holds all
-# InfluxDB credentials — they never reach the customer VM, and no enrollment
-# secret is baked into this install. We write GATEWAY_URL into ips1.cfg (which
-# the agent already sources) rather than a separate gateway.url file.
 echo "Recording gateway URL for agent self-enrollment..."
 sed -i "s|^GATEWAY_URL=\"\"|GATEWAY_URL=\"$IPS1_GATEWAY_URL\"|" /etc/ips1/ips1.cfg
 echo "... done."

@@ -41,13 +41,33 @@ else
 	exit 1
 fi
 
-# Load gateway credentials from the AES-256-GCM encrypted store. creds decrypts
-# using a key derived from this machine's /etc/machine-id — the blob is unreadable
-# on any other host even if copied. On a freshly installed host the store does
-# not exist yet; that is expected and handled by the self-enrollment step below.
+# Load gateway cred from the machine-bound (key derived from /etc/machine-id); 
 creds=$(/usr/local/bin/creds reveal 2>/dev/null)
 if [ -n "$creds" ]; then
 	eval "$creds"
+fi
+
+# a reused volume carries the old instance's
+# sealed store + /etc/machine-id, so the agent would keep reporting under the
+# deleted instance's SID. Compare the sealed SID to the live metadata uuid each
+# run; on a confirmed mismatch, reset to pre-enrollment state and re-enroll below.
+# Fail-safe: only act on a confirmed mismatch (unreachable metadata = no-op).
+# Stop/start/reboot/resize keep the uuid, so only volume re-homing triggers this.
+if [ -n "$SERVER_TOKEN" ] && [ -n "$SID" ]; then
+	LIVE_META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
+	LIVE_SID=$(printf '%s' "$LIVE_META" | sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
+	if [ -n "$LIVE_SID" ] && [ "$LIVE_SID" != "$SID" ]; then
+		echo "IPS1 agent: instance identity changed ($SID -> $LIVE_SID); volume appears reused on a new instance. Dropping stale credentials and re-enrolling." >&2
+		# Restore the gateway URL the installer blanked after first enrollment —
+		# the sealed store we are about to delete is its only remaining copy, and
+		# the self-enrollment step needs it to reach the gateway on later ticks.
+		if [ -n "$GATEWAY_URL" ]; then
+			sed -i "s|^GATEWAY_URL=.*|GATEWAY_URL=\"$GATEWAY_URL\"|" "$ScriptPath"/ips1.cfg 2>/dev/null || true
+		fi
+		rm -f /etc/ips1/.d
+		SERVER_TOKEN=""
+		SID=""
+	fi
 fi
 
 # First-run self-enrollment: if this host has no sealed token yet, prove its
@@ -1152,8 +1172,7 @@ done
 echo "InfluxDB Line Protocol Payload (timestamp=$TIMESTAMP):"
 echo "$LINES"
 
-# Send line protocol to the IPS1 gateway. The gateway authenticates the SERVER_TOKEN,
-# resolves the SID, and forwards to InfluxDB using its own credentials.
+# Send line protocol to the gateway. 
 GW_HTTP_CODE=$(curl -s -o /tmp/ips1_gw_response.txt -w "%{http_code}" --max-time 15 \
   -XPOST "$GATEWAY_URL/v1/write" \
   -H "Authorization: Bearer $SERVER_TOKEN" \
