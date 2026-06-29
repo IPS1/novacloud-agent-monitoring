@@ -66,6 +66,30 @@ command -v crontab >/dev/null 2>&1 || { echo "ERROR: crontab is required to run 
 	|| { echo "ERROR: wget or curl is required to run this agent." >&2; exit 1; }
 echo "... done."
 
+# Honor a customer opt-out set as instance metadata at launch
+# (`openstack server create --property ips1_agent=disabled`). Opt-out model:
+# install proceeds unless the flag holds an explicit off value. An unreachable
+# metadata service or unrecognized value falls through to a normal install, so a
+# transient metadata outage never silently skips monitoring. The gateway
+# enforces the same flag at enroll time, so a reused volume whose old agent is
+# still present is also covered (its next tick self-exits and re-enrollment is
+# refused).
+echo "Checking instance metadata for monitoring opt-out..."
+META_URL="http://169.254.169.254/openstack/latest/meta_data.json"
+if command -v curl >/dev/null 2>&1; then
+	AGENT_META=$(curl -s --connect-timeout 5 "$META_URL")
+else
+	AGENT_META=$(wget -t 1 -T 5 -qO- "$META_URL")
+fi
+AGENT_FLAG=$(printf '%s' "$AGENT_META" | sed -n 's/.*"ips1_agent": *"\([^"]*\)".*/\1/p' | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+case "$AGENT_FLAG" in
+	off|false|0|no|disabled)
+		echo "Monitoring disabled by instance metadata (ips1_agent=$AGENT_FLAG); skipping agent installation."
+		exit 0
+		;;
+esac
+echo "... done."
+
 # Remove old agent (if exists)
 echo "Checking if there's any old IPS1 agent already installed..."
 if [ -d /etc/ips1 ]

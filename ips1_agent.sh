@@ -47,6 +47,28 @@ if [ -n "$creds" ]; then
 	eval "$creds"
 fi
 
+# Honor a customer opt-out set as instance metadata at launch
+# (`openstack server create --property ips1_agent=disabled`). This is the
+# opt-out model: monitoring runs unless the flag holds an explicit off value.
+# An unreachable metadata service or unrecognized value falls through to
+# monitoring, so a transient metadata outage never silently stops reporting.
+# The gateway enforces the same flag at enroll time, so this on-VM check is a
+# convenience/kill-switch, not the security boundary.
+AGENT_META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
+AGENT_FLAG=$(printf '%s' "$AGENT_META" | sed -n 's/.*"ips1_agent": *"\([^"]*\)".*/\1/p' | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+case "$AGENT_FLAG" in
+	off|false|0|no|disabled)
+		echo "IPS1 agent: monitoring disabled by instance metadata (ips1_agent=$AGENT_FLAG); exiting." >&2
+		# Best-effort: if we have the privilege, stop the per-minute wakeups
+		# entirely. The agent usually runs as the unprivileged 'ips1' user, which
+		# cannot manage systemd, so the early exit below is the real opt-out.
+		if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
+			systemctl disable --now ips1-agent.timer >/dev/null 2>&1 || true
+		fi
+		exit 0
+		;;
+esac
+
 # a reused volume carries the old instance's
 # sealed store + /etc/machine-id, so the agent would keep reporting under the
 # deleted instance's SID. Compare the sealed SID to the live metadata uuid each
