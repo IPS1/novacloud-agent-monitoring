@@ -94,10 +94,10 @@ fi
 
 # First-run self-enrollment: if this host has no sealed token yet, prove its
 # OpenStack identity (instance uuid + project_id, read from the metadata service)
-# to the gateway. The (uuid, project_id) pair must have been pre-authorized via
-# POST /v1/admin/authorize-sid. On success we seal the returned token and
-# continue this run; otherwise we exit 0 so the next timer tick retries — this
-# removes any race with the provisioning backend authorizing the SID.
+# to the gateway, which verifies it live against Nova. On success we seal the
+# returned token and continue this run; otherwise we exit 0 so the next timer
+# tick retries — this absorbs the brief window before the instance is ACTIVE in
+# Nova and any transient verification outage.
 if [ -z "$GATEWAY_URL" ] || [ -z "$SERVER_TOKEN" ]
 then
 	# GATEWAY_URL is sourced from ips1.cfg above (the installer writes it there).
