@@ -41,21 +41,63 @@ else
 	exit 1
 fi
 
-# Load gateway credentials from the AES-256-GCM encrypted store. creds decrypts
-# using a key derived from this machine's /etc/machine-id — the blob is unreadable
-# on any other host even if copied. On a freshly installed host the store does
-# not exist yet; that is expected and handled by the self-enrollment step below.
+# Load gateway cred from the machine-bound (key derived from /etc/machine-id); 
 creds=$(/usr/local/bin/creds reveal 2>/dev/null)
 if [ -n "$creds" ]; then
 	eval "$creds"
 fi
 
+# Honor a customer opt-out set as instance metadata at launch
+# (`openstack server create --property ips1_agent=disabled`). This is the
+# opt-out model: monitoring runs unless the flag holds an explicit off value.
+# An unreachable metadata service or unrecognized value falls through to
+# monitoring, so a transient metadata outage never silently stops reporting.
+# The gateway enforces the same flag at enroll time, so this on-VM check is a
+# convenience/kill-switch, not the security boundary.
+AGENT_META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
+AGENT_FLAG=$(printf '%s' "$AGENT_META" | sed -n 's/.*"ips1_agent": *"\([^"]*\)".*/\1/p' | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+case "$AGENT_FLAG" in
+	off|false|0|no|disabled)
+		echo "IPS1 agent: monitoring disabled by instance metadata (ips1_agent=$AGENT_FLAG); exiting." >&2
+		# Best-effort: if we have the privilege, stop the per-minute wakeups
+		# entirely. The agent usually runs as the unprivileged 'ips1' user, which
+		# cannot manage systemd, so the early exit below is the real opt-out.
+		if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
+			systemctl disable --now ips1-agent.timer >/dev/null 2>&1 || true
+		fi
+		exit 0
+		;;
+esac
+
+# a reused volume carries the old instance's
+# sealed store + /etc/machine-id, so the agent would keep reporting under the
+# deleted instance's SID. Compare the sealed SID to the live metadata uuid each
+# run; on a confirmed mismatch, reset to pre-enrollment state and re-enroll below.
+# Fail-safe: only act on a confirmed mismatch (unreachable metadata = no-op).
+# Stop/start/reboot/resize keep the uuid, so only volume re-homing triggers this.
+if [ -n "$SERVER_TOKEN" ] && [ -n "$SID" ]; then
+	LIVE_META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
+	LIVE_SID=$(printf '%s' "$LIVE_META" | sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
+	if [ -n "$LIVE_SID" ] && [ "$LIVE_SID" != "$SID" ]; then
+		echo "IPS1 agent: instance identity changed ($SID -> $LIVE_SID); volume appears reused on a new instance. Dropping stale credentials and re-enrolling." >&2
+		# Restore the gateway URL the installer blanked after first enrollment —
+		# the sealed store we are about to delete is its only remaining copy, and
+		# the self-enrollment step needs it to reach the gateway on later ticks.
+		if [ -n "$GATEWAY_URL" ]; then
+			sed -i "s|^GATEWAY_URL=.*|GATEWAY_URL=\"$GATEWAY_URL\"|" "$ScriptPath"/ips1.cfg 2>/dev/null || true
+		fi
+		rm -f /etc/ips1/.d
+		SERVER_TOKEN=""
+		SID=""
+	fi
+fi
+
 # First-run self-enrollment: if this host has no sealed token yet, prove its
 # OpenStack identity (instance uuid + project_id, read from the metadata service)
-# to the gateway. The (uuid, project_id) pair must have been pre-authorized via
-# POST /v1/admin/authorize-sid. On success we seal the returned token and
-# continue this run; otherwise we exit 0 so the next timer tick retries — this
-# removes any race with the provisioning backend authorizing the SID.
+# to the gateway, which verifies it live against Nova. On success we seal the
+# returned token and continue this run; otherwise we exit 0 so the next timer
+# tick retries — this absorbs the brief window before the instance is ACTIVE in
+# Nova and any transient verification outage.
 if [ -z "$GATEWAY_URL" ] || [ -z "$SERVER_TOKEN" ]
 then
 	# GATEWAY_URL is sourced from ips1.cfg above (the installer writes it there).
@@ -136,53 +178,6 @@ function base64prep() {
 	echo "$str"
 }
 
-# Function used to perform outgoing PING tests
-function pingstatus() {
-	local TargetName=$1
-	local PingTarget=$2
-	if ! [[ "$TargetName" =~ ^[a-zA-Z0-9\.\-_]+$ ]]
-	then
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid PING target name value" >> "$ScriptPath"/debug.log; fi
-		exit 1
-	fi
-	if ! [[ "$PingTarget" =~ ^[a-zA-Z0-9\.\-:]+$ ]]
-	then
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid PING target value" >> "$ScriptPath"/debug.log; fi
-		exit 1
-	fi
-	if ! [[ "$OutgoingPingsCount" =~ ^[0-9]+$ ]] || (( OutgoingPingsCount < 10 || OutgoingPingsCount > 40 ))
-	then
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid PING count value" >> "$ScriptPath"/debug.log; fi
-		exit 1
-	fi
-	PING_OUTPUT=$(ping "$PingTarget" -c "$OutgoingPingsCount" 2>/dev/null)
-	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T])PING_OUTPUT:\n$PING_OUTPUT" >> "$ScriptPath"/debug.log; fi
-	PACKET_LOSS=$(echo "$PING_OUTPUT" | grep -o '[0-9]\+% packet loss' | cut -d'%' -f1)
-	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T])PACKET_LOSS: $PACKET_LOSS" >> "$ScriptPath"/debug.log; fi
-	if [ -z "$PACKET_LOSS" ]
-	then
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to extract packet loss" >> "$ScriptPath"/debug.log; fi
-		exit 1
-	fi
-	RTT_LINE=$(echo "$PING_OUTPUT" | grep 'rtt min/avg/max/mdev')
-	if [ -n "$RTT_LINE" ]
-	then
-		AVG_RTT=$(echo "$RTT_LINE" | awk -F'/' '{print $5}')
-		AVG_RTT=$(echo | awk "{print $AVG_RTT * 1000}" | awk '{printf "%18.0f",$1}' | xargs)
-	else
-		AVG_RTT="0"
-	fi
-	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T])AVG_RTT: $AVG_RTT" >> "$ScriptPath"/debug.log; fi
-	echo "$TargetName,$PingTarget,$PACKET_LOSS,$AVG_RTT;" >> "$ScriptPath"/ping.txt
-}
-
-# Check if the agent needs to run Outgoing PING tests
-if [ "$1" == "ping" ]
-then
-	pingstatus "$2" "$3"
-	exit 1
-fi
-
 # Clear debug.log every day at midnight
 if [ -z "$(date +%H | sed 's/^0*//')" ] && [ -z "$(date +%M | sed 's/^0*//')" ] && [ -f "$ScriptPath"/debug.log ]
 then
@@ -237,27 +232,10 @@ then
 	done
 fi
 
-# Outgoing PING
-if [ -n "$OutgoingPings" ]
-then
-	IFS='|' read -r -a OutgoingPingsArray <<< "$OutgoingPings"
-	for i in "${OutgoingPingsArray[@]}"
-	do
-		IFS=',' read -r -a OutgoingPing <<< "$i"
-		bash "$ScriptPath"/ips1_agent.sh ping "${OutgoingPing[0]}" "${OutgoingPing[1]}" & 
-	done
-fi
-
 # Network interfaces
-if [ -n "$NetworkInterfaces" ]
-then
-	# Use the network interfaces specified in Settings
-	IFS=',' read -r -a NetworkInterfacesArray <<< "$NetworkInterfaces"
-else
-	# Automatically detect the network interfaces
-	NetworkInterfacesArray=()
-	while IFS='' read -r line; do NetworkInterfacesArray+=("$line"); done < <(ip a | grep BROADCAST | grep 'state UP' | awk '{print $2}' | awk -F ":" '{print $1}' | awk -F "@" '{print $1}')
-fi
+# Automatically detect the active network interfaces
+NetworkInterfacesArray=()
+while IFS='' read -r line; do NetworkInterfacesArray+=("$line"); done < <(ip a | grep BROADCAST | grep 'state UP' | awk '{print $2}' | awk -F ":" '{print $1}' | awk -F "@" '{print $1}')
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interfaces: ${NetworkInterfacesArray[*]}" >> "$ScriptPath"/debug.log; fi
 
 # Initial network usage
@@ -274,19 +252,6 @@ do
 	aTX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $10}')
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interface $NIC RX: ${aRX[$NIC]} TX: ${aTX[$NIC]}" >> "$ScriptPath"/debug.log; fi
 done
-
-# Port connections
-if [ -n "$ConnectionPorts" ]
-then
-	IFS=',' read -r -a ConnectionPortsArray <<< "$ConnectionPorts"
-	declare -A Connections
-	netstat=$(ss -ntu | awk '{print $5}')
-	for cPort in "${ConnectionPortsArray[@]}"
-	do
-		Connections[$cPort]=$(echo "$netstat" | grep -c ":$cPort$")
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port $cPort Connections: ${Connections[$cPort]}" >> "$ScriptPath"/debug.log; fi
-	done
-fi
 
 # Temperature
 declare -A TempArray
@@ -504,17 +469,6 @@ do
 
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Traffic: ${tRX[*]} ${tTX[*]}" >> "$ScriptPath"/debug.log; fi
 	
-	# Port connections
-	if [ -n "$ConnectionPorts" ]
-	then
-		netstat=$(ss -ntu | awk '{print $5}')
-		for cPort in "${ConnectionPortsArray[@]}"
-		do
-			Connections[$cPort]=$(echo | awk "{print ${Connections[$cPort]} + $(echo "$netstat" | grep -c ":$cPort$")}")
-		done
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port Connections: ${Connections[*]}" >> "$ScriptPath"/debug.log; fi
-	fi
-
 	# Temperature
 	if [ "$(find /sys/class/thermal/thermal_zone*/type 2> /dev/null | wc -l)" -gt 0 ]
 	then
@@ -824,21 +778,6 @@ IPv6=$(echo -ne "$IPv6" | base64 | tr -d '\n\r\t ')
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interfaces: $NICS IPv4: $IPv4 IPv6: $IPv6" >> "$ScriptPath"/debug.log; fi
 
-# Port connections
-CONN=""
-if [ -n "$ConnectionPorts" ]
-then
-	for cPort in "${ConnectionPortsArray[@]}"
-	do
-		CON=$(echo | awk "{print ${Connections[$cPort]} / $X}")
-		CON=$(echo "$CON" | awk '{printf "%18.0f",$1}' | xargs)
-		CONN="$CONN$cPort,$CON;"
-	done
-fi
-CONN=$(echo -ne "$CONN" | base64 | tr -d '\n\r\t ')
-
-if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port Connections: $CONN" >> "$ScriptPath"/debug.log; fi
-
 # Temperature
 TEMP=""
 if [ -n "$TempName" ]
@@ -873,159 +812,17 @@ SRVCS=$(echo -ne "$SRVCS" | base64 | tr -d '\n\r\t ')
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Services: $SRVCS" >> "$ScriptPath"/debug.log; fi
 
-# Check Software RAID
-RAID=""
-ZP=""
-dfPB1=$(timeout 3 df -PB1 2>/dev/null)
-mdstat=$(cat /proc/mdstat 2>/dev/null)
-declare -A zpooldiskusage
-if [ "$CheckSoftRAID" -gt 0 ]
-then
-	for i in $(echo -ne "$dfPB1" | awk '$1 ~ /\// {print}' | awk '{print $1}')
-	do
-		mdadm=$(mdadm -D "$i" 2>/dev/null)
-		# DEBUG
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) mdadm -D $i:\n$mdadm" >> "$ScriptPath"/debug.log; fi
-		if [ -n "$mdadm" ]
-		then
-			mnt=$(echo -ne "$dfPB1" | grep "$i " | awk '{print $(NF)}')
-			RAID="$RAID$mnt,$i,$mdadm;"
-		fi
-	done
-	if [ -x "$(command -v zpool)" ]
-	then
-		zpoolsoverall=$(zpool status 2>/dev/null)
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool status:\n$zpoolsoverall" >> "$ScriptPath"/debug.log; fi
-		if ! grep -q "no pools available" <<< "$zpoolsoverall"
-		then
-			zpools=()
-			while IFS= read -r line; do zpools+=("$line"); done < <(echo -ne "$zpoolsoverall"  2>/dev/null | grep "pool: " | awk '{print $2}')
-			for i in "${zpools[@]}"
-			do
-				zpoolstatus=$(zpool status "$i" 2>/dev/null)
-				zpoolstatus=$(echo -ne "$zpoolstatus" | base64 | tr -d '\n\r\t ')
-				mnt=$(echo -ne "$dfPB1" | grep -E "$i[ /]" | head -n 1 | awk '{print $(NF)}')
-				ZP="$ZP$mnt,$i,$zpoolstatus;"
-				zpooldiskusage[$mnt]=$(zfs get -H -o value -p used,avail "$i" | xargs | awk '{printf "%.0f %.0f %.0f", $1+$2, $1, $2}')
-			done
-		fi
-	fi
-fi
-RAID=$(echo -ne "$RAID" | base64 | tr -d '\n\r\t ')
-ZP=$(echo -ne "$ZP" | base64 | tr -d '\n\r\t ')
-
-if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) RAID: $RAID ZP: $ZP" >> "$ScriptPath"/debug.log; fi
-
 # Disks usage
 DISKs=""
 IFS=$'\n' read -d '' -r -a DISKsArray < <(timeout 3 df -TPB1 | sed 1d | grep -v -E 'tmpfs' | awk '{print $(NF)","$2","$3","$4","$5";"}')
 for i in "${DISKsArray[@]}"
 do
 	IFS=',' read -r mount_point filesystem_type total_size used_size available_size <<< "$i"
-	if [ -n "${zpooldiskusage[$mount_point]}" ]
-	then
-		IFS=' ' read -r zpool_total zpool_allocated zpool_free <<< "${zpooldiskusage[$mount_point]}"
-		total_size=$zpool_total
-		used_size=$zpool_allocated
-		available_size=$zpool_free
-	fi
 	DISKs="$DISKs$mount_point,$filesystem_type,$total_size,$used_size,$available_size;"
 done
 DISKs=$(echo -ne "$DISKs" | base64 | tr -d '\n\r\t ')
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) DISKs: $DISKs" >> "$ScriptPath"/debug.log; fi
-
-# Check Drive Health
-DH=""
-if [ "$CheckDriveHealth" -gt 0 ]
-then
-	if [ -x "$(command -v smartctl)" ] #Using S.M.A.R.T. (for regular HDD/SSD)
-	then
-		for i in $(lsblk -lp | grep ' disk' | awk '{print $1}')
-		do
-			DHealth=$(smartctl -A "$i")
-			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -A $i:\n$DHealth" >> "$ScriptPath"/debug.log; fi
-			if grep -q 'Attribute' <<< "$DHealth"
-			then
-				DHealth=$(smartctl -H "$i")"\n$DHealth"
-				DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
-				DInfo="$(smartctl -i "$i")"
-				DModel="$(echo "$DInfo" | grep -i "Device Model:" | awk -F ':' '{print $2}' | xargs)"
-				DSerial="$(echo "$DInfo" | grep -i "Serial Number:" | awk -F ':' '{print $2}' | xargs)"
-				i=${i##*/}
-				DH="$DH""1,$i,$DHealth,$DModel,$DSerial;"
-			else # If initial read has failed, see if drives are behind hardware raid
-				MegaRaid=()
-				while IFS='' read -r line; do MegaRaid+=("$line"); done < <(smartctl --scan | grep megaraid | awk '{print $(3)}')
-				if [ ${#MegaRaid[@]} -gt 0 ]
-				then
-					MegaRaidN=0
-					for MegaRaidID in "${MegaRaid[@]}"
-					do
-						DHealth=$(smartctl -A -d "$MegaRaidID" "$i")
-						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -A -d $MegaRaidID $i:\n$DHealth" >> "$ScriptPath"/debug.log; fi
-						if grep -q 'Attribute' <<< "$DHealth"
-						then
-							MegaRaidN=$((MegaRaidN + 1))
-							DHealth=$(smartctl -H -d "$MegaRaidID" "$i")"\n$DHealth"
-							DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
-							DInfo="$(smartctl -i -d "$MegaRaidID" "$i")"
-							DModel="$(echo "$DInfo" | grep -i "Device Model:" | awk -F ':' '{print $2}' | xargs)"
-							DSerial="$(echo "$DInfo" | grep -i "Serial Number:" | awk -F ':' '{print $2}' | xargs)"
-							ii=${i##*/}
-							DH="$DH""1,${ii}[$MegaRaidN],$DHealth,$DModel,$DSerial;"
-						fi
-					done
-					break
-				fi
-			fi
-		done
-	fi
-	if [ -x "$(command -v nvme)" ] #Using nvme-cli (for NVMe)
-	then
-		NVMeList="$(nvme list)"
-		NVMeListJ="$(nvme list -o json)"
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) NVMe List:\n$NVMeList" >> "$ScriptPath"/debug.log; fi
-		for i in $(lsblk -lp | grep ' disk' | awk '{print $1}')
-		do
-			DHealth=$(nvme smart-log "$i" 2>/dev/null)
-			if grep -q 'NVME' <<< "$DHealth"
-			then
-				if [ -x "$(command -v smartctl)" ]
-				then
-					ii=${i##*/}
-					DHealth=$(smartctl -H /dev/"${ii%??}")"\n$DHealth"
-				fi
-				DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
-				DeviceBlock=$(echo "$NVMeListJ" | awk -v RS='{' -v dev="$i" '$0 ~ dev')
-				DModel=$(echo "$DeviceBlock" | grep '"ModelNumber"' | sed -E 's/.*"ModelNumber"\s*:\s*"([^"]+)".*/\1/')
-				DSerial=$(echo "$DeviceBlock" | grep '"SerialNumber"' | sed -E 's/.*"SerialNumber"\s*:\s*"([^"]+)".*/\1/')
-				DFirmware=$(echo "$DeviceBlock" | grep '"Firmware"' | sed -E 's/.*"Firmware"\s*:\s*"([^"]+)".*/\1/')
-				if [ -z "$DModel" ]
-				then
-					MODELCOL=$(echo "$NVMeList" | grep "^Node" | tr -s ' ' | tr ' ' '\n' | grep -n -x "Model" | cut -d: -f1)
-					DModel="$(echo "$NVMeList" | grep "$i" | sed -E 's/[ ]{2,}/|/g' | awk -F '|' -v col="$MODELCOL" '{print $col}')"
-				else
-					if [ -n "$DFirmware" ]
-					then
-						DModel="$DModel - $DFirmware"
-					fi
-				fi
-				if [ -z "$DSerial" ]
-				then
-					SNCOL=$(echo "$NVMeList" | grep "^Node" | tr -s ' ' | tr ' ' '\n' | grep -n -x "SN" | cut -d: -f1)
-					DSerial="$(echo "$NVMeList" | grep "$i" | sed -E 's/[ ]{2,}/|/g' | awk -F '|' -v col="$SNCOL" '{print $col}')"
-				fi
-				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) NVMe $i Model: $DModel Serial: $DSerial" >> "$ScriptPath"/debug.log; fi
-				i=${i##*/}
-				DH="$DH""2,$i,$DHealth,$DModel,$DSerial;"
-			fi
-		done
-	fi
-fi
-DH=$(echo -ne "$DH" | base64 | tr -d '\n\r\t ')
-
-if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) DH: $DH" >> "$ScriptPath"/debug.log; fi
 
 # Custom Variables
 CV=""
@@ -1038,19 +835,6 @@ then
 fi
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CV: $CV" >> "$ScriptPath"/debug.log; fi
-
-# Outgoing PING
-OPING=""
-if [ -n "$OutgoingPings" ]
-then
-	OPING=$(grep -v '^$' "$ScriptPath"/ping.txt | tr -d '\n' | base64 | tr -d '\n\r\t ')
-	if [ -f "$ScriptPath"/ping.txt ]
-	then
-		rm -f "$ScriptPath"/ping.txt
-	fi
-fi
-
-if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) OPING: $OPING" >> "$ScriptPath"/debug.log; fi
 
 # Running Processes
 RPS1=""
@@ -1107,13 +891,6 @@ for SERVICE in "${!SRVCSR[@]}"; do
 service_status,sid=$SID,host=$(hostname),service=$SERVICE status=${STATUS}i $TIMESTAMP"
 done
 
-# Add port connection counts
-for PORT in "${!Connections[@]}"; do
-  avg=$(awk "BEGIN{printf \"%.0f\", ${Connections[$PORT]} / $X}")
-  LINES="$LINES
-port_connections,sid=$SID,host=$(hostname),port=$PORT established=${avg}i $TIMESTAMP"
-done
-
 # Add disk IOPS stats
 for DISK in "${!IOPSRead[@]}"; do
   READ_BPS=${IOPSRead[$DISK]}
@@ -1152,8 +929,7 @@ done
 echo "InfluxDB Line Protocol Payload (timestamp=$TIMESTAMP):"
 echo "$LINES"
 
-# Send line protocol to the IPS1 gateway. The gateway authenticates the SERVER_TOKEN,
-# resolves the SID, and forwards to InfluxDB using its own credentials.
+# Send line protocol to the gateway. 
 GW_HTTP_CODE=$(curl -s -o /tmp/ips1_gw_response.txt -w "%{http_code}" --max-time 15 \
   -XPOST "$GATEWAY_URL/v1/write" \
   -H "Authorization: Bearer $SERVER_TOKEN" \

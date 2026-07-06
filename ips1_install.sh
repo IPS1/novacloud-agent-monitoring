@@ -66,6 +66,30 @@ command -v crontab >/dev/null 2>&1 || { echo "ERROR: crontab is required to run 
 	|| { echo "ERROR: wget or curl is required to run this agent." >&2; exit 1; }
 echo "... done."
 
+# Honor a customer opt-out set as instance metadata at launch
+# (`openstack server create --property ips1_agent=disabled`). Opt-out model:
+# install proceeds unless the flag holds an explicit off value. An unreachable
+# metadata service or unrecognized value falls through to a normal install, so a
+# transient metadata outage never silently skips monitoring. The gateway
+# enforces the same flag at enroll time, so a reused volume whose old agent is
+# still present is also covered (its next tick self-exits and re-enrollment is
+# refused).
+echo "Checking instance metadata for monitoring opt-out..."
+META_URL="http://169.254.169.254/openstack/latest/meta_data.json"
+if command -v curl >/dev/null 2>&1; then
+	AGENT_META=$(curl -s --connect-timeout 5 "$META_URL")
+else
+	AGENT_META=$(wget -t 1 -T 5 -qO- "$META_URL")
+fi
+AGENT_FLAG=$(printf '%s' "$AGENT_META" | sed -n 's/.*"ips1_agent": *"\([^"]*\)".*/\1/p' | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+case "$AGENT_FLAG" in
+	off|false|0|no|disabled)
+		echo "Monitoring disabled by instance metadata (ips1_agent=$AGENT_FLAG); skipping agent installation."
+		exit 0
+		;;
+esac
+echo "... done."
+
 # Remove old agent (if exists)
 echo "Checking if there's any old IPS1 agent already installed..."
 if [ -d /etc/ips1 ]
@@ -114,13 +138,6 @@ sed -i 's/\r$//' /etc/ips1/ips1_update.sh
 echo "... done."
 
 # Record the gateway URL in the agent config for first-run self-enrollment.
-# Enrollment no longer happens here: on its first timer tick the agent proves
-# this instance's OpenStack identity (uuid + project_id, read from the metadata
-# service) to the gateway, receives a server-scoped token, and seals it into
-# /etc/ips1/.d (AES-256-GCM, bound to /etc/machine-id). The gateway holds all
-# InfluxDB credentials — they never reach the customer VM, and no enrollment
-# secret is baked into this install. We write GATEWAY_URL into ips1.cfg (which
-# the agent already sources) rather than a separate gateway.url file.
 echo "Recording gateway URL for agent self-enrollment..."
 sed -i "s|^GATEWAY_URL=\"\"|GATEWAY_URL=\"$IPS1_GATEWAY_URL\"|" /etc/ips1/ips1.cfg
 echo "... done."
@@ -134,25 +151,12 @@ then
 fi
 echo "... done."
 
-# NOTE: software RAID (CheckSoftRAID) and Drive Health (CheckDriveHealth) are not
-# offered to customers. They stay OFF (0) in ips1.cfg and are intentionally not
-# wired to any install argument.
-
 # Check if 'View running processes' should be enabled
 echo "Checking if 'View running processes' should be enabled..."
 if [ "$3" -eq "1" ]
 then
 	echo "Enabling 'View running processes' in the agent config..."
 	sed -i "s/RunningProcesses=0/RunningProcesses=1/" /etc/ips1/ips1.cfg
-fi
-echo "... done."
-
-# Check if any ports to monitor number of connections on
-echo "Checking if any ports to monitor number of connections on..."
-if [ "$4" != "0" ]
-then
-	echo "Ports found, inserting them into the agent config..."
-	sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$4\"/" /etc/ips1/ips1.cfg
 fi
 echo "... done."
 
