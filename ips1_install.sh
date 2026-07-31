@@ -53,9 +53,12 @@ if [ "$EUID" -ne 0 ]
 fi
 echo "... done."
 
-# Check if user has selected to run agent as 'root' or as 'ips1' user
+# The first positional arg (previously "RunAsRoot") is retained only for
+# backward compatibility with existing callers so that $2 (CheckServices) and
+# $3 (RunningProcesses) keep their positions. It is now ignored — the agent
+# always runs as the unprivileged 'ips1' user.
 if [ -z "$1" ]
-	then echo "ERROR: First parameter (RunAsRoot) missing."
+	then echo "ERROR: First parameter (reserved) missing."
 	exit
 fi
 
@@ -195,10 +198,8 @@ echo "... done."
 
 # Install systemd service + timer
 echo "Installing systemd service and timer..."
+# The agent always runs as the unprivileged 'ips1' user (no root option).
 SYSTEMD_SERVICE_USER="ips1"
-if [ "$1" -eq "1" ]; then
-	SYSTEMD_SERVICE_USER="root"
-fi
 
 cat > /etc/systemd/system/ips1-agent.service <<EOF
 [Unit]
@@ -231,8 +232,15 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
+# The timer is the single scheduler: enable+start it so runs fire every minute
+# and catch up after a reboot (Persistent=true). Do NOT enable/--now the service
+# itself — letting both the service's own WantedBy and the timer trigger it
+# produced redundant, near-simultaneous activations at install/boot, which is a
+# race that could double-enroll and strand the gateway token.
 systemctl enable --now ips1-agent.timer
-systemctl enable --now ips1-agent.service
+# One immediate run so first enrollment starts now instead of waiting up to a
+# minute for the first timer tick. Single start — the agent's flock makes this
+# safe even if the first timer tick fires at the same moment.
 systemctl start ips1-agent.service
 echo "... done."
 

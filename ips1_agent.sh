@@ -41,11 +41,44 @@ else
 	exit 1
 fi
 
-# Load gateway cred from the machine-bound (key derived from /etc/machine-id); 
+# Serialize agent runs. Two overlapping runs — a manual invocation racing the
+# systemd timer, a slow tick overlapping the next, or the self-heal reset racing
+# an in-flight run — can both enter the enroll+seal path and leave the gateway
+# holding a freshly minted token that no sealed store has, which then 401s until
+# a manual reinstall. Hold an exclusive whole-run lock; if another run already
+# holds it, exit 0 and let that run finish this cycle. Fail open (run without the
+# lock) when flock is unavailable so monitoring never silently stops.
+LOCK_FILE="$ScriptPath/.lock"
+if command -v flock >/dev/null 2>&1 && ( : >>"$LOCK_FILE" ) 2>/dev/null; then
+	exec 9>>"$LOCK_FILE"
+	if ! flock -n 9; then
+		echo "IPS1 agent: another run is already in progress; skipping this tick." >&2
+		exit 0
+	fi
+fi
+
+# Load gateway cred from the machine-bound (key derived from /etc/machine-id);
 creds=$(/usr/local/bin/creds reveal 2>/dev/null)
 if [ -n "$creds" ]; then
 	eval "$creds"
 fi
+
+# Reset the agent to its pre-enrollment state so the enrollment block below (or
+# the next timer tick) re-enrolls from scratch. Restores GATEWAY_URL into
+# ips1.cfg first, because the installer blanks that line after the first
+# enrollment and the sealed store we are about to delete is its only remaining
+# copy — without it a later tick could not reach the gateway to re-enroll.
+# Safe against a genuinely deauthorized instance: re-enrollment goes through
+# /v1/enroll, which the gateway verifies live against Nova and refuses if the
+# instance no longer qualifies, so this can never re-authorize a revoked host.
+reset_enrollment() {
+	if [ -n "$GATEWAY_URL" ]; then
+		sed -i "s|^GATEWAY_URL=.*|GATEWAY_URL=\"$GATEWAY_URL\"|" "$ScriptPath"/ips1.cfg 2>/dev/null || true
+	fi
+	rm -f /etc/ips1/.d
+	SERVER_TOKEN=""
+	SID=""
+}
 
 # Honor a customer opt-out set as instance metadata at launch
 # (`openstack server create --property ips1_agent=disabled`). This is the
@@ -59,9 +92,9 @@ AGENT_FLAG=$(printf '%s' "$AGENT_META" | sed -n 's/.*"ips1_agent": *"\([^"]*\)".
 case "$AGENT_FLAG" in
 	off|false|0|no|disabled)
 		echo "IPS1 agent: monitoring disabled by instance metadata (ips1_agent=$AGENT_FLAG); exiting." >&2
-		# Best-effort: if we have the privilege, stop the per-minute wakeups
-		# entirely. The agent usually runs as the unprivileged 'ips1' user, which
-		# cannot manage systemd, so the early exit below is the real opt-out.
+		# The agent always runs as the unprivileged 'ips1' user, which cannot
+		# manage systemd, so the early exit below is the real opt-out. The
+		# root-only branch remains only as a courtesy for manual root runs.
 		if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
 			systemctl disable --now ips1-agent.timer >/dev/null 2>&1 || true
 		fi
@@ -75,20 +108,13 @@ esac
 # run; on a confirmed mismatch, reset to pre-enrollment state and re-enroll below.
 # Fail-safe: only act on a confirmed mismatch (unreachable metadata = no-op).
 # Stop/start/reboot/resize keep the uuid, so only volume re-homing triggers this.
+# Reuses the metadata document fetched for the opt-out check above — the same
+# tick never needs two snapshots of an immutable identity.
 if [ -n "$SERVER_TOKEN" ] && [ -n "$SID" ]; then
-	LIVE_META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
-	LIVE_SID=$(printf '%s' "$LIVE_META" | sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
+	LIVE_SID=$(printf '%s' "$AGENT_META" | sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
 	if [ -n "$LIVE_SID" ] && [ "$LIVE_SID" != "$SID" ]; then
 		echo "IPS1 agent: instance identity changed ($SID -> $LIVE_SID); volume appears reused on a new instance. Dropping stale credentials and re-enrolling." >&2
-		# Restore the gateway URL the installer blanked after first enrollment —
-		# the sealed store we are about to delete is its only remaining copy, and
-		# the self-enrollment step needs it to reach the gateway on later ticks.
-		if [ -n "$GATEWAY_URL" ]; then
-			sed -i "s|^GATEWAY_URL=.*|GATEWAY_URL=\"$GATEWAY_URL\"|" "$ScriptPath"/ips1.cfg 2>/dev/null || true
-		fi
-		rm -f /etc/ips1/.d
-		SERVER_TOKEN=""
-		SID=""
+		reset_enrollment
 	fi
 fi
 
@@ -105,7 +131,12 @@ then
 		echo "ERROR: not enrolled and GATEWAY_URL is not set in ips1.cfg. Re-run the installer." >&2
 		exit 1
 	fi
-	META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
+	# Reuse the metadata document already fetched for the opt-out check; only
+	# refetch if that earlier call came back empty (transient metadata outage).
+	META="$AGENT_META"
+	if [ -z "$META" ]; then
+		META=$(curl -s --connect-timeout 5 http://169.254.169.254/openstack/latest/meta_data.json)
+	fi
 	SID=$(printf '%s' "$META" | sed -n 's/.*"uuid": *"\([^"]*\)".*/\1/p')
 	PROJECT_ID=$(printf '%s' "$META" | sed -n 's/.*"project_id": *"\([^"]*\)".*/\1/p')
 	if [ -z "$SID" ] || [ -z "$PROJECT_ID" ]; then
@@ -139,10 +170,15 @@ fi
 # Script start time
 ScriptStartTime=$(date +[%Y-%m-%d\ %T)
 
-# Service status function
+# Hostname, resolved once — it is interpolated into every line-protocol line,
+# and forking $(hostname) per line adds up.
+HOST=$(hostname)
+
+# Service status function. Uses the $PSEF process snapshot captured just before
+# each service-check loop, so N services cost one `ps` instead of N.
 function servicestatus() {
 	# Check first via ps
-	if (( $(ps -ef | grep -E "[\/ ]$1([^\/]|$)" | grep -v "grep" | wc -l) > 0 ))
+	if (( $(printf '%s\n' "${PSEF:-$(ps -ef)}" | grep -E "[\/ ]$1([^\/]|$)" | grep -cv "grep") > 0 ))
 	then # Up
 		echo "1"
 	else # Down, try with systemctl (if available)
@@ -178,8 +214,12 @@ function base64prep() {
 	echo "$str"
 }
 
+# Current hour/minute as plain integers (10# strips leading zeros without sed)
+H=$((10#$(date +%H)))
+M=$((10#$(date +%M)))
+
 # Clear debug.log every day at midnight
-if [ -z "$(date +%H | sed 's/^0*//')" ] && [ -z "$(date +%M | sed 's/^0*//')" ] && [ -f "$ScriptPath"/debug.log ]
+if [ "$H" -eq 0 ] && [ "$M" -eq 0 ] && [ -f "$ScriptPath"/debug.log ]
 then
 	rm -f "$ScriptPath"/debug.log
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Cleared debug.log" >> "$ScriptPath"/debug.log; fi
@@ -189,13 +229,8 @@ fi
 START=$(date +%s)
 tTIMEDIFF=0
 
-# Get current minute
-M=$(date +%M | sed 's/^0*//')
-if [ -z "$M" ]
+if [ "$M" -eq 0 ]
 then
-	# If minute is empty, set it to 0
-	M=0
-
 	# Clear ips1_cron.log every hour
 	if [ -f "$ScriptPath"/ips1_cron.log ]
 	then
@@ -239,30 +274,34 @@ while IFS='' read -r line; do NetworkInterfacesArray+=("$line"); done < <(ip a |
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interfaces: ${NetworkInterfacesArray[*]}" >> "$ScriptPath"/debug.log; fi
 
 # Initial network usage
-T=$(cat /proc/net/dev)
 declare -A aRX
 declare -A aTX
 declare -A tRX
 declare -A tTX
-
-# Loop through network interfaces
+declare -A WantNIC
 for NIC in "${NetworkInterfacesArray[@]}"
 do
-	aRX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $2}')
-	aTX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $10}')
-	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interface $NIC RX: ${aRX[$NIC]} TX: ${aTX[$NIC]}" >> "$ScriptPath"/debug.log; fi
+	WantNIC[$NIC]=1
+	tRX[$NIC]=0
+	tTX[$NIC]=0
 done
 
-# Temperature
-declare -A TempArray
-declare -A TempArrayCnt
-SensorsCmdDisable=0
+# Capture RX/TX byte counters for every monitored NIC in one pass over
+# /proc/net/dev (RX bytes = 1st and TX bytes = 9th value after "iface:").
+while read -r NIC_NAME NIC_RX NIC_TX
+do
+	[ -n "${WantNIC[$NIC_NAME]+x}" ] || continue
+	aRX[$NIC_NAME]=$NIC_RX
+	aTX[$NIC_NAME]=$NIC_TX
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interface $NIC_NAME RX: ${aRX[$NIC_NAME]} TX: ${aTX[$NIC_NAME]}" >> "$ScriptPath"/debug.log; fi
+done < <(awk -F: 'NR>2 {iface=$1; gsub(/[[:space:]]/,"",iface); split($2,f," "); print iface, f[1], f[9]}' /proc/net/dev)
 
 # Check Services
 if [ -n "$CheckServices" ]
 then
 	declare -A SRVCSR
 	IFS=',' read -r -a CheckServicesArray <<< "$CheckServices"
+	PSEF=$(ps -ef)
 	for i in "${CheckServicesArray[@]}"
 	do
 		SRVCSR[$i]=$(( ${SRVCSR[$i]} + $(servicestatus "$i") ))
@@ -271,10 +310,13 @@ then
 fi
 
 # Disks IOPS
+# Resolve mountpoint→device and capture the starting /proc/diskstats counters
+# with one pass per data source instead of grep pipelines per disk.
 declare -A vDISKs
-for i in $(timeout 3 df | awk '$1 ~ /\// {print}' | awk '{print $(NF)}')
+LSBLK_L=$(lsblk -l)
+for i in $(timeout 3 df | awk '$1 ~ /\// {print $(NF)}')
 do
-	vDISKs[$i]=$(lsblk -l | grep -w "$i" | awk '{print $1}' | head -1)
+	vDISKs[$i]=$(printf '%s\n' "$LSBLK_L" | awk -v mp="$i" '{for (f = 2; f <= NF; f++) if ($f == mp) {print $1; exit}}')
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Disk $i: ${vDISKs[$i]}" >> "$ScriptPath"/debug.log; fi
 done
 declare -A BlockSize
@@ -284,37 +326,49 @@ declare -A READOPS_START
 declare -A WRITEOPS_START
 declare -A IOPSReadOps
 declare -A IOPSWriteOps
-diskstats=$(cat /proc/diskstats)
-lsblk_blocksize=$(lsblk -l -b -o NAME,PHY-SEC,MOUNTPOINTS)
+
+# Device → physical sector size, first match wins (lsblk lists each device once)
+declare -A PHYSEC
+while read -r DEV_NAME DEV_PHYSEC _
+do
+	[ -n "${PHYSEC[$DEV_NAME]+x}" ] || PHYSEC[$DEV_NAME]=$DEV_PHYSEC
+done < <(lsblk -l -b -o NAME,PHY-SEC,MOUNTPOINTS | sed 1d)
+
+# Device → diskstats counters: reads completed ($4), sectors read ($6),
+# writes completed ($8), sectors written ($10)
+declare -A DS_OPS_READ DS_SEC_READ DS_OPS_WRITE DS_SEC_WRITE
+while read -r DEV_NAME DEV_ROPS DEV_RSEC DEV_WOPS DEV_WSEC
+do
+	DS_OPS_READ[$DEV_NAME]=$DEV_ROPS
+	DS_SEC_READ[$DEV_NAME]=$DEV_RSEC
+	DS_OPS_WRITE[$DEV_NAME]=$DEV_WOPS
+	DS_SEC_WRITE[$DEV_NAME]=$DEV_WSEC
+done < <(awk '{print $3, $4, $6, $8, $10}' /proc/diskstats)
+
 for i in "${!vDISKs[@]}"
 do
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) IOPS Disk $i: ${vDISKs[$i]}" >> "$ScriptPath"/debug.log; fi
-	BlockSize[$i]=$(echo "$lsblk_blocksize" | grep -w "${vDISKs[$i]}" | awk '{print $2}')
-	if [ -z "${BlockSize[$i]}" ] || ! [[ ${BlockSize[$i]} =~ ^[0-9]+$ ]] || [ "$(echo "${BlockSize[$i]}" | wc -l)" -ne 1 ] || [ "${BlockSize[$i]}" -eq 0 ]
+	# An unresolved mountpoint has no device; keep counters at 0 (and never use
+	# an empty string as an array subscript — older bash rejects it).
+	DEV=${vDISKs[$i]}
+	BlockSize[$i]=""
+	IOPSRead[$i]=0
+	IOPSWrite[$i]=0
+	READOPS_START[$i]=0
+	WRITEOPS_START[$i]=0
+	if [ -n "$DEV" ]
+	then
+		BlockSize[$i]=${PHYSEC[$DEV]:-}
+		IOPSRead[$i]=${DS_SEC_READ[$DEV]:-0}
+		IOPSWrite[$i]=${DS_SEC_WRITE[$DEV]:-0}
+		READOPS_START[$i]=${DS_OPS_READ[$DEV]:-0}
+		WRITEOPS_START[$i]=${DS_OPS_WRITE[$DEV]:-0}
+	fi
+	if [ -z "${BlockSize[$i]}" ] || ! [[ ${BlockSize[$i]} =~ ^[0-9]+$ ]] || [ "${BlockSize[$i]}" -eq 0 ]
 	then
 		BlockSize[$i]=512
 	fi
-	IOPSRead[$i]=0
-	IOPSWrite[$i]=0
-	if [ ! -z "${vDISKs[$i]}" ]
-	then
-		IOPSRead[$i]=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $6}')
-		IOPSWrite[$i]=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $10}')
-		READOPS_START[$i]=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $4}')
-		WRITEOPS_START[$i]=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $8}')
-
-	fi
-	if [ -z "${IOPSRead[$i]}" ]
-	then
-		IOPSRead[$i]=0
-	fi
-	if [ -z "${IOPSWrite[$i]}" ]
-	then
-		IOPSWrite[$i]=0
-	fi
-	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Disk $i Block Size: ${BlockSize[$i]} IOPS Read: ${IOPSRead[$i]} Write: ${IOPSWrite[$i]}" >> "$ScriptPath"/debug.log; fi 
-	[ -z "${READOPS_START[$i]}" ] && READOPS_START[$i]=0
-	[ -z "${WRITEOPS_START[$i]}" ] && WRITEOPS_START[$i]=0
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Disk $i Block Size: ${BlockSize[$i]} IOPS Read: ${IOPSRead[$i]} Write: ${IOPSWrite[$i]}" >> "$ScriptPath"/debug.log; fi
 done
 
 # Zpool IOPS
@@ -345,232 +399,94 @@ fi
 RunTimes=$(echo | awk "{print 60 / $CollectEveryXSeconds}")
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Collecting data for $RunTimes loops" >> "$ScriptPath"/debug.log; fi
 
+# Memory totals cannot change between samples — read both once, in one pass
+read -r bRAM cRAM <<< "$(awk '/^MemTotal:/ {t=$2} /^SwapTotal:/ {s=$2} END{print t+0, s+0}' /proc/meminfo)"
+
+# Initialize accumulators
+tCPU=0; tCPUwa=0; tCPUst=0; tCPUus=0; tCPUsy=0; tCPUidle=0; tCPUSpeed=0
+tloadavg1=0; tloadavg5=0; tloadavg15=0
+tRAM=0; tRAMSwap=0; tRAMBuff=0; tRAMCache=0
+
 # Collect data loop
 for X in $(seq "$RunTimes")
 do
 	# Get vmstat
 	VMSTAT=$(vmstat "$CollectEveryXSeconds" 2 | tail -1)
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) $VMSTAT" >> "$ScriptPath"/debug.log; fi
-	
-	# CPU usage
-	CPU=$(echo "$VMSTAT" | awk '{print 100 - $15}')
-	tCPU=$(echo | awk "{print $tCPU + $CPU}")
-	
-	# CPU IO wait
-	CPUwa=$(echo "$VMSTAT" | awk '{print $16}')
-	tCPUwa=$(echo | awk "{print $tCPUwa + $CPUwa}")
-	
-	# CPU steal time
-	CPUst=$(echo "$VMSTAT" | awk '{print $17}')
-	tCPUst=$(echo | awk "{print $tCPUst + $CPUst}")
 
-	# CPU user time
-	CPUus=$(echo "$VMSTAT" | awk '{print $13}')
-	tCPUus=$(echo | awk "{print $tCPUus + $CPUus}")
-	
-	# CPU system time
-	CPUsy=$(echo "$VMSTAT" | awk '{print $14}')
-	tCPUsy=$(echo | awk "{print $tCPUsy + $CPUsy}")
+	# CPU clock: per-core MHz rounded and summed in one pass
+	CPUSpeed=$(awk -F': *' '/^cpu MHz/ {s += int($2 + 0.5)} END{printf "%d", s}' /proc/cpuinfo)
 
-	# CPU idle time
-	CPUidle=$(echo "$VMSTAT" | awk '{print $15}')
-	tCPUidle=$(echo | awk "{print $tCPUidle + $CPUidle}")
-	
-	# CPU clock
-	CPUSpeed=$(grep 'cpu MHz' /proc/cpuinfo | awk -F": " '{print $2}' | awk '{printf "%18.0f",$1}' | xargs | sed -e 's/ /+/g')
-	if [ -z "$CPUSpeed" ]
-	then
-		CPUSpeed=0
-	fi
-	tCPUSpeed=$(echo | awk "{print $tCPUSpeed + $CPUSpeed}")
+	# CPU Load, straight from /proc (no subprocess)
+	read -r loadavg1 loadavg5 loadavg15 _ < /proc/loadavg
 
-	# CPU Load
-	loadavg=$(cat /proc/loadavg)
-	loadavg1=$(echo "$loadavg" | awk '{print $1}')
-	tloadavg1=$(echo | awk "{print $tloadavg1 + $loadavg1}")
-	loadavg5=$(echo "$loadavg" | awk '{print $2}')
-	tloadavg5=$(echo | awk "{print $tloadavg5 + $loadavg5}")
-	loadavg15=$(echo "$loadavg" | awk '{print $3}')
-	tloadavg15=$(echo | awk "{print $tloadavg15 + $loadavg15}")
+	# Derive every per-sample value from the vmstat line and update all
+	# accumulators in a single awk pass (replaces ~30 subshells per sample):
+	# us=$13 sy=$14 id=$15 wa=$16 st=$17, swap used=$3, free/buff/cache=$4/$5/$6
+	read -r CPU CPUwa CPUst CPUus CPUsy CPUidle RAM RAMSwap RAMBuff RAMCache \
+		tCPU tCPUwa tCPUst tCPUus tCPUsy tCPUidle tRAM tRAMSwap tRAMBuff tRAMCache \
+		tloadavg1 tloadavg5 tloadavg15 tCPUSpeed <<< "$(echo "$VMSTAT" | awk \
+		-v bram="$bRAM" -v cram="$cRAM" -v spd="${CPUSpeed:-0}" \
+		-v l1="$loadavg1" -v l5="$loadavg5" -v l15="$loadavg15" \
+		-v tcpu="$tCPU" -v twa="$tCPUwa" -v tst="$tCPUst" -v tus="$tCPUus" \
+		-v tsy="$tCPUsy" -v tid="$tCPUidle" -v tram="$tRAM" -v tswap="$tRAMSwap" \
+		-v tbuff="$tRAMBuff" -v tcache="$tRAMCache" \
+		-v tl1="$tloadavg1" -v tl5="$tloadavg5" -v tl15="$tloadavg15" -v tspd="$tCPUSpeed" '{
+		cpu = 100 - $15; wa = $16; st = $17; us = $13; sy = $14; idle = $15
+		ram = 100 - (($4 + $5 + $6) * 100 / bram)
+		swap = (cram > 0) ? ($3 * 100 / cram) : 0
+		buff = $5 * 100 / bram
+		cache = $6 * 100 / bram
+		print cpu, wa, st, us, sy, idle, ram, swap, buff, cache, \
+			tcpu + cpu, twa + wa, tst + st, tus + us, tsy + sy, tid + idle, \
+			tram + ram, tswap + swap, tbuff + buff, tcache + cache, \
+			tl1 + l1, tl5 + l5, tl15 + l15, tspd + spd
+	}')"
 
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CPU: $CPU IO wait: $CPUwa Steal time: $CPUst User time: $CPUus System time: $CPUsy Load: $loadavg1 $loadavg5 $loadavg15" >> "$ScriptPath"/debug.log; fi
-	
-	# RAM usage
-	aRAM=$(echo "$VMSTAT" | awk '{print $4 + $5 + $6}')
-	bRAM=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}')
-	RAM=$(echo | awk "{print $aRAM * 100 / $bRAM}")
-	RAM=$(echo | awk "{print 100 - $RAM}")
-	tRAM=$(echo | awk "{print $tRAM + $RAM}")
-
-	# RAM swap usage
-	aRAMSwap=$(echo "$VMSTAT" | awk '{print $3}')
-	cRAM=$(grep "^SwapTotal:" /proc/meminfo | awk '{print $2}')
-	if [ "$cRAM" -gt 0 ]
-	then
-		RAMSwap=$(echo | awk "{print $aRAMSwap * 100 / $cRAM}")
-	else
-		RAMSwap=0
-	fi
-	tRAMSwap=$(echo | awk "{print $tRAMSwap + $RAMSwap}")
-	
-	# RAM buffers usage
-	aRAMBuff=$(echo "$VMSTAT" | awk '{print $5}')
-	RAMBuff=$(echo | awk "{print $aRAMBuff * 100 / $bRAM}")
-	tRAMBuff=$(echo | awk "{print $tRAMBuff + $RAMBuff}")
-	
-	# RAM cache usage
-	aRAMCache=$(echo "$VMSTAT" | awk '{print $6}')
-	RAMCache=$(echo | awk "{print $aRAMCache * 100 / $bRAM}")
-	tRAMCache=$(echo | awk "{print $tRAMCache + $RAMCache}")
-
 	if [ "$DEBUG" -eq 1 ]; then
       echo -e "$ScriptStartTime-$(date +%T]) RAM: $RAM Swap: $RAMSwap Buffers: $RAMBuff Cache: $RAMCache" >> "$ScriptPath"/debug.log
     fi
 
-    # --- RAM used/free in BYTES for charts (compute once per minute) ---
-    MemTotalKB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
-    MemAvailKB=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-    if [ -z "$MemAvailKB" ] || [ "$MemAvailKB" -eq 0 ]; then
-      MemFreeKB=$(awk '/^MemFree:/ {print $2}' /proc/meminfo)
-      BuffersKB=$(awk '/^Buffers:/ {print $2}' /proc/meminfo)
-      CachedKB=$(awk '/^Cached:/ {print $2}' /proc/meminfo)
-      SReclaimKB=$(awk '/^SReclaimable:/ {print $2}' /proc/meminfo)
-      ShmemKB=$(awk '/^Shmem:/ {print $2}' /proc/meminfo)
-      MemAvailKB=$(( MemFreeKB + BuffersKB + CachedKB + SReclaimKB - ShmemKB ))
-    fi
-    RAMUsedBytes=$(( (MemTotalKB - MemAvailKB) * 1024 ))
-    RAMFreeBytes=$(( MemAvailKB * 1024 ))
-
 	# Network usage
-	T=$(cat /proc/net/dev)
 	END=$(date +%s)
-	TIMEDIFF=$(echo | awk "{print $END - $START}")
-	tTIMEDIFF=$(echo | awk "{print $tTIMEDIFF + $TIMEDIFF}")
-	START=$(date +%s)
-	
-	# Loop through network interfaces
-	for NIC in "${NetworkInterfacesArray[@]}"
+	TIMEDIFF=$(( END - START ))
+	[ "$TIMEDIFF" -le 0 ] && TIMEDIFF=1
+	tTIMEDIFF=$(( tTIMEDIFF + TIMEDIFF ))
+	START=$END
+
+	# Read all NIC counters in one pass and accumulate per-interface rates
+	# with shell arithmetic (byte counters and seconds are integers).
+	while read -r NIC_NAME NIC_RX NIC_TX
 	do
-		# Received Traffic
-		RX=$(echo | awk "{print $(echo "$T" | grep -w "$NIC:" | awk '{print $2}') - ${aRX[$NIC]}}")
-		RX=$(echo | awk "{print $RX / $TIMEDIFF}")
-		RX=$(echo "$RX" | awk '{printf "%18.0f",$1}' | xargs)
-		aRX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $2}')
-		tRX[$NIC]=$(echo | awk "{print ${tRX[$NIC]} + $RX}")
-		tRX[$NIC]=$(echo "${tRX[$NIC]}" | awk '{printf "%18.0f",$1}' | xargs)
-		# Transferred Traffic
-		TX=$(echo | awk "{print $(echo "$T" | grep -w "$NIC:" | awk '{print $10}') - ${aTX[$NIC]}}")
-		TX=$(echo | awk "{print $TX / $TIMEDIFF}")
-		TX=$(echo "$TX" | awk '{printf "%18.0f",$1}' | xargs)
-		aTX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $10}')
-		tTX[$NIC]=$(echo | awk "{print ${tTX[$NIC]} + $TX}")
-		tTX[$NIC]=$(echo "${tTX[$NIC]}" | awk '{printf "%18.0f",$1}' | xargs)
-	done
+		[ -n "${WantNIC[$NIC_NAME]+x}" ] || continue
+		RX=$(( (NIC_RX - ${aRX[$NIC_NAME]:-NIC_RX}) / TIMEDIFF ))
+		TX=$(( (NIC_TX - ${aTX[$NIC_NAME]:-NIC_TX}) / TIMEDIFF ))
+		aRX[$NIC_NAME]=$NIC_RX
+		aTX[$NIC_NAME]=$NIC_TX
+		tRX[$NIC_NAME]=$(( ${tRX[$NIC_NAME]:-0} + RX ))
+		tTX[$NIC_NAME]=$(( ${tTX[$NIC_NAME]:-0} + TX ))
+	done < <(awk -F: 'NR>2 {iface=$1; gsub(/[[:space:]]/,"",iface); split($2,f," "); print iface, f[1], f[9]}' /proc/net/dev)
 
 	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Traffic: ${tRX[*]} ${tTX[*]}" >> "$ScriptPath"/debug.log; fi
-	
-	# Temperature
-	if [ "$(find /sys/class/thermal/thermal_zone*/type 2> /dev/null | wc -l)" -gt 0 ]
-	then
-		TempArrayIndex=()
-		TempArrayVal=()
-		for zone in /sys/class/thermal/thermal_zone*/
-		do
-			if [[ -f "${zone}/type" ]] && [[ -f "${zone}/temp" ]]
-			then
-				type_value=$(<"${zone}/type")
-				temp_value=$(<"${zone}/temp")
-				if [[ -n $type_value ]]
-				then
-					TempArrayIndex+=("$type_value")
-				fi
-				if [[ $temp_value =~ ^[0-9]+$ ]]
-				then
-					TempArrayVal+=("$temp_value")
-				else
-					TempArrayVal+=("0")
-				fi
-			fi
-		done
-		TempNameCnt=0
-		for TempName in "${TempArrayIndex[@]}"
-		do
-			TempArray[$TempName]=${TempArray[$TempName]:-0}
-			TempArrayCnt[$TempName]=${TempArrayCnt[$TempName]:-0}
-			if [[ ${TempArrayVal[$TempNameCnt]} =~ ^[0-9]+$ ]]
-			then
-				TempArray[$TempName]=$((${TempArray[$TempName]} + ${TempArrayVal[$TempNameCnt]}))
-				TempArrayCnt[$TempName]=$((TempArrayCnt[$TempName] + 1))
-			fi
-			TempNameCnt=$((TempNameCnt + 1))
-		done
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature thermal_zone: ${TempArray[*]}" >> "$ScriptPath"/debug.log; fi
-	else
-		if command -v "sensors" > /dev/null 2>&1 && [ "$SensorsCmdDisable" -eq 0 ]
-		then
-			SensorsCmd=$(sensors -A 2>/dev/null)
-			if [ $? -eq 0 ]
-			then
-				SensorsArray=()
-				while IFS='' read -r line; do SensorsArray+=("$line"); done <<< "$SensorsCmd"
-				for i in "${SensorsArray[@]}"
-				do
-					if [ -n "$i" ]
-					then
-						if [[ "$i" != *":"* ]] && [[ "$i" != *"="* ]]
-						then
-							SensorsCat="$i"
-						else
-							if [[ "$i" == *":"* ]] && [[ "$i" == *"°C"* ]]
-							then
-								TempName="$SensorsCat|"$(echo "$i" | awk -F"°C" '{print $1}' | awk -F":" '{print $1}' | sed 's/ /_/g' | xargs)
-								TempVal=$(echo "$i" | awk -F"°C" '{print $1}' | awk -F":" '{print $2}' | sed 's/ //g' | awk '{printf "%18.3f",$1}' | sed -e 's/\.//g' | xargs)
-								TempArray[$TempName]=$((${TempArray[$TempName]} + TempVal))
-								TempArrayCnt[$TempName]=$((TempArrayCnt[$TempName] + 1))
-							fi
-						fi
-					fi
-				done
-				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature sensors: ${TempArray[*]}" >> "$ScriptPath"/debug.log; fi
-			else
-				SensorsCmdDisable=1
-				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to get temperature via sensors" >> "$ScriptPath"/debug.log; fi
-			fi
-		else
-			if command -v "ipmitool" > /dev/null 2>&1
-			then
-				IPMIArray=()
-				while IFS='' read -r line; do IPMIArray+=("$line"); done < <(timeout -s 9 3 ipmitool sdr type Temperature)
-				for i in "${IPMIArray[@]}"
-				do
-					if [ -n "$i" ]
-					then
-						if [[ "$i" == *"degrees"* ]]
-						then
-							TempName=$(echo "$i" | awk -F"|" '{print $1}' | xargs | sed 's/ /_/g')
-							TempVal=$(echo "$i" | awk -F"|" '{print $NF}' | awk -F"degrees" '{print $1}' | sed 's/ //g' | awk '{printf "%18.3f",$1}' | sed -e 's/\.//g' | xargs)
-							TempArray[$TempName]=$((${TempArray[$TempName]} + TempVal))
-							TempArrayCnt[$TempName]=$((TempArrayCnt[$TempName] + 1))
-						fi
-					fi
-				done
-				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature ipmitool: ${TempArray[*]}" >> "$ScriptPath"/debug.log; fi
-			fi
-		fi
-	fi
-	
+
 	# Check if minute changed, so we can end the loop
-	MM=$(date +%M | sed 's/^0*//')
-	if [ -z "$MM" ]
-	then
-		MM=0
-	fi
-	if [ "$MM" -ne "$M" ] 
+	MM=$((10#$(date +%M)))
+	if [ "$MM" -ne "$M" ]
 	then
 		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Minute changed, ending loop" >> "$ScriptPath"/debug.log; fi
 		break
 	fi
 done
+
+# --- RAM used/free in BYTES for charts (one meminfo pass per minute) ---
+read -r MemTotalKB MemAvailKB MemFreeKB BuffersKB CachedKB SReclaimKB ShmemKB <<< \
+	"$(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} /^MemFree:/ {f=$2} /^Buffers:/ {b=$2} /^Cached:/ {c=$2} /^SReclaimable:/ {r=$2} /^Shmem:/ {m=$2} END{print t+0, a+0, f+0, b+0, c+0, r+0, m+0}' /proc/meminfo)"
+if [ "$MemAvailKB" -eq 0 ]; then
+  MemAvailKB=$(( MemFreeKB + BuffersKB + CachedKB + SReclaimKB - ShmemKB ))
+fi
+RAMUsedBytes=$(( (MemTotalKB - MemAvailKB) * 1024 ))
+RAMFreeBytes=$(( MemAvailKB * 1024 ))
 
 # Get user running the agent
 User=$(whoami)
@@ -649,60 +565,27 @@ if [ -z "$tCPUSpeed" ] || [ "$tCPUSpeed" -eq 0 ]
 then
 	CPUSpeed=$(echo "$lscpu" | grep "^CPU max MHz" | awk '{print $NF}' | awk '{printf "%18.0f",$1}' | xargs)
 else
-	CPUSpeed=$(echo | awk "{print $tCPUSpeed / $CPUCores / $X}" | awk '{printf "%18.0f",$1}' | xargs)
+	CPUSpeed=$(awk -v t="$tCPUSpeed" -v c="$CPUCores" -v x="$X" 'BEGIN{printf "%.0f", t / c / x}')
 fi
 
-# Average CPU usage
-CPU=$(echo | awk "{print $tCPU   / $X}")
+# RAM sizes were read once before the sampling loop
+RAMSize=$bRAM
+RAMSwapSize=$cRAM
 
-# Average CPU IO wait
-CPUwa=$(echo | awk "{print $tCPUwa / $X}")
-
-# Average CPU steal time
-CPUst=$(echo | awk "{print $tCPUst / $X}")
-
-# Average CPU user time
-CPUus=$(echo | awk "{print $tCPUus / $X}")
-
-# Average CPU system time
-CPUsy=$(echo | awk "{print $tCPUsy / $X}")
-
-# Average CPU idle time
-CPUidle=$(echo | awk "{print $tCPUidle / $X}")
-
-# Recompute CPU usage as us+sy+wa+st+idle (≈100)
-CPU=$(awk -v us="$CPUus" -v sy="$CPUsy" -v wa="$CPUwa" -v st="$CPUst" -v id="$CPUidle" \
-        'BEGIN{printf "%.2f", us+sy+wa+st+id}')
-
-# CPU Load
-loadavg1=$(echo | awk "{print $tloadavg1 / $X}")
-loadavg5=$(echo | awk "{print $tloadavg5 / $X}")
-loadavg15=$(echo | awk "{print $tloadavg15 / $X}")
+# Averages over the X collected samples, all in one awk pass. CPU is reported
+# as us+sy+wa+st+idle (≈100), matching the historical recomputation.
+read -r CPU CPUwa CPUst CPUus CPUsy CPUidle loadavg1 loadavg5 loadavg15 RAM RAMSwap RAMBuff RAMCache <<< "$(awk \
+	-v x="$X" -v twa="$tCPUwa" -v tst="$tCPUst" -v tus="$tCPUus" -v tsy="$tCPUsy" -v tid="$tCPUidle" \
+	-v tl1="$tloadavg1" -v tl5="$tloadavg5" -v tl15="$tloadavg15" \
+	-v tram="$tRAM" -v tswap="$tRAMSwap" -v tbuff="$tRAMBuff" -v tcache="$tRAMCache" \
+	-v swapsize="$RAMSwapSize" 'BEGIN{
+	wa = twa / x; st = tst / x; us = tus / x; sy = tsy / x; idle = tid / x
+	printf "%.2f ", us + sy + wa + st + idle
+	print wa, st, us, sy, idle, tl1 / x, tl5 / x, tl15 / x, \
+		tram / x, (swapsize > 0 ? tswap / x : 0), tbuff / x, tcache / x
+}')"
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CPU Model: $CPUModel Sockets: $CPUSockets Cores: $CPUCores Threads: $CPUThreads Speed: $CPUSpeed CPU: $CPU IO wait: $CPUwa Steal time: $CPUst User time: $CPUus System time: $CPUsy Load: $loadavg1 $loadavg5 $loadavg15" >> "$ScriptPath"/debug.log; fi
-
-# RAM size
-RAMSize=$(grep ^MemTotal: /proc/meminfo | awk '{print $2}')
-
-# RAM Usage
-RAM=$(echo | awk "{print $tRAM / $X}")
-
-# RAM swap size
-RAMSwapSize=$(grep "^SwapTotal:" /proc/meminfo | awk '{print $2}')
-
-# RAM swap usage
-if [ "$RAMSwapSize" -gt 0 ]
-then
-	RAMSwap=$(echo | awk "{print $tRAMSwap / $X}")
-else
-	RAMSwap=0
-fi
-
-# RAM buffers usage
-RAMBuff=$(echo | awk "{print $tRAMBuff / $X}")
-
-# RAM cache usage
-RAMCache=$(echo | awk "{print $tRAMCache / $X}")
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) RAM Size: $RAMSize Usage: $RAM Swap Size: $RAMSwapSize Usage: $RAMSwap Buffers: $RAMBuff Cache: $RAMCache" >> "$ScriptPath"/debug.log; fi
 
@@ -714,19 +597,41 @@ IOPS=""
 if [ -z "$tTIMEDIFF" ] || [ "$tTIMEDIFF" -le 0 ]; then
   tTIMEDIFF=1
 fi
-diskstats=$(cat /proc/diskstats)
+# Re-read the closing /proc/diskstats counters in one pass, then compute all
+# four rates per disk with a single awk call (was ~10 pipelines per disk).
+while read -r DEV_NAME DEV_ROPS DEV_RSEC DEV_WOPS DEV_WSEC
+do
+	DS_OPS_READ[$DEV_NAME]=$DEV_ROPS
+	DS_SEC_READ[$DEV_NAME]=$DEV_RSEC
+	DS_OPS_WRITE[$DEV_NAME]=$DEV_WOPS
+	DS_SEC_WRITE[$DEV_NAME]=$DEV_WSEC
+done < <(awk '{print $3, $4, $6, $8, $10}' /proc/diskstats)
 for i in "${!vDISKs[@]}"
 do
-	IOPSRead[$i]=$(echo | awk "{print $(echo | awk "{print $(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $6}') - ${IOPSRead[$i]}}" 2> /dev/null) * ${BlockSize[$i]} / $tTIMEDIFF}" 2> /dev/null)
-	IOPSRead[$i]=$(echo "${IOPSRead[$i]}" | awk '{printf "%18.0f",$1}' | xargs)
-	IOPSWrite[$i]=$(echo | awk "{print $(echo | awk "{print $(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $10}') - ${IOPSWrite[$i]}}" 2> /dev/null) * ${BlockSize[$i]} / $tTIMEDIFF}" 2> /dev/null)
-	IOPSWrite[$i]=$(echo "${IOPSWrite[$i]}" | awk '{printf "%18.0f",$1}' | xargs)
+	# Same empty-subscript guard as the initial capture: no device → all zeros
+	DEV=${vDISKs[$i]}
+	CUR_RSEC=0; CUR_WSEC=0; CUR_ROPS=0; CUR_WOPS=0
+	if [ -n "$DEV" ]
+	then
+		CUR_RSEC=${DS_SEC_READ[$DEV]:-0}
+		CUR_WSEC=${DS_SEC_WRITE[$DEV]:-0}
+		CUR_ROPS=${DS_OPS_READ[$DEV]:-0}
+		CUR_WOPS=${DS_OPS_WRITE[$DEV]:-0}
+	fi
+	read -r DISK_R_BPS DISK_W_BPS DISK_R_IOPS DISK_W_IOPS <<< "$(awk \
+		-v rsec="$CUR_RSEC" -v rsec0="${IOPSRead[$i]:-0}" \
+		-v wsec="$CUR_WSEC" -v wsec0="${IOPSWrite[$i]:-0}" \
+		-v rops="$CUR_ROPS" -v rops0="${READOPS_START[$i]:-0}" \
+		-v wops="$CUR_WOPS" -v wops0="${WRITEOPS_START[$i]:-0}" \
+		-v bs="${BlockSize[$i]}" -v t="$tTIMEDIFF" 'BEGIN{
+		if (t <= 0) t = 1
+		printf "%.0f %.0f %.2f %.2f", (rsec - rsec0) * bs / t, (wsec - wsec0) * bs / t, (rops - rops0) / t, (wops - wops0) / t
+	}')"
+	IOPSRead[$i]=$DISK_R_BPS
+	IOPSWrite[$i]=$DISK_W_BPS
+	IOPSReadOps[$i]=$DISK_R_IOPS
+	IOPSWriteOps[$i]=$DISK_W_IOPS
 	IOPS="$IOPS$i,${IOPSRead[$i]},${IOPSWrite[$i]};"
-	# true IOPS = delta ops / elapsed seconds (fields 4 & 8)
-	r_ops_now=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $4}')
-	w_ops_now=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $8}')
-	IOPSReadOps[$i]=$(awk -v cur="$r_ops_now" -v base="${READOPS_START[$i]:-0}" -v t="$tTIMEDIFF" 'BEGIN{ if(t<=0)t=1; printf "%.2f",(cur-base)/t }')
-	IOPSWriteOps[$i]=$(awk -v cur="$w_ops_now" -v base="${WRITEOPS_START[$i]:-0}" -v t="$tTIMEDIFF" 'BEGIN{ if(t<=0)t=1; printf "%.2f",(cur-base)/t }')
 done
 # Zpool IOPS
 if [ -x "$(command -v zpool)" ]
@@ -760,13 +665,15 @@ TX=0
 NICS=""
 IPv4=""
 IPv6=""
+declare -A RXBPS
+declare -A TXBPS
 for NIC in "${NetworkInterfacesArray[@]}"
 do
-	# Individual NIC network usage
-	RX=$(echo | awk "{print ${tRX[$NIC]} / $X}")
-	RX=$(echo "$RX" | awk '{printf "%18.0f",$1}' | xargs)
-	TX=$(echo | awk "{print ${tTX[$NIC]} / $X}")
-	TX=$(echo "$TX" | awk '{printf "%18.0f",$1}' | xargs)
+	# Individual NIC network usage, averaged over the X samples. Stored per
+	# NIC so the line-protocol assembly below reuses them without recomputing.
+	read -r RX TX <<< "$(awk -v rx="${tRX[$NIC]:-0}" -v tx="${tTX[$NIC]:-0}" -v x="$X" 'BEGIN{printf "%.0f %.0f", rx / x, tx / x}')"
+	RXBPS[$NIC]=$RX
+	TXBPS[$NIC]=$TX
 	NICS="$NICS$NIC,$RX,$TX;"
 	# Individual NIC IP addresses
 	IPv4="$IPv4$NIC,$(ip -4 addr show "$NIC" | grep -oP 'inet \K[\d.]+' | xargs | sed 's/ /,/g');"
@@ -778,25 +685,11 @@ IPv6=$(echo -ne "$IPv6" | base64 | tr -d '\n\r\t ')
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interfaces: $NICS IPv4: $IPv4 IPv6: $IPv6" >> "$ScriptPath"/debug.log; fi
 
-# Temperature
-TEMP=""
-if [ -n "$TempName" ]
-then
-	for TempName in "${!TempArray[@]}"
-	do
-		TMP=$(echo | awk "{print ${TempArray[$TempName]} / ${TempArrayCnt[$TempName]}}")
-		TMP=$(echo "$TMP" | awk '{printf "%18.0f",$1}' | xargs)
-		TEMP="$TEMP$TempName,$TMP;"
-	done
-fi
-TEMP=$(echo -ne "$TEMP" | base64 | tr -d '\n\r\t ')
-
-if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature: $TEMP" >> "$ScriptPath"/debug.log; fi
-
 # Check Services
 SRVCS=""
 if [ -n "$CheckServices" ]
 then
+	PSEF=$(ps -ef)
 	for i in "${CheckServicesArray[@]}"
 	do
 		SRVCSR[$i]=$(( ${SRVCSR[$i]} + $(servicestatus "$i") ))
@@ -865,10 +758,10 @@ Time=$(date +%Y-%m-%d\ %T\ %Z | base64 | tr -d '\n\r\t ')
 
 TIMESTAMP=$(date +%s)
 
-LINE_CPU="cpu_stats,sid=$SID,host=$(hostname) cpu=$CPU,idle=$CPUidle,wa=$CPUwa,st=$CPUst,us=$CPUus,sy=$CPUsy,cpuspeed=$CPUSpeed $TIMESTAMP"
+LINE_CPU="cpu_stats,sid=$SID,host=$HOST cpu=$CPU,idle=$CPUidle,wa=$CPUwa,st=$CPUst,us=$CPUus,sy=$CPUsy,cpuspeed=$CPUSpeed $TIMESTAMP"
 LINE_LOAD="load_stats,sid=$SID load1=$loadavg1,load5=$loadavg5,load15=$loadavg15 $TIMESTAMP"
-LINE_MEM="memory_stats,sid=$SID,host=$(hostname) ram_used_bytes=${RAMUsedBytes}i,ram_free_bytes=${RAMFreeBytes}i $TIMESTAMP"
-LINE_SYS="system_stats,sid=$SID,host=$(hostname) uptime=${Uptime}i,reqreboot=${RequiresReboot}i,alive=1i $TIMESTAMP"
+LINE_MEM="memory_stats,sid=$SID,host=$HOST ram_used_bytes=${RAMUsedBytes}i,ram_free_bytes=${RAMFreeBytes}i $TIMESTAMP"
+LINE_SYS="system_stats,sid=$SID,host=$HOST uptime=${Uptime}i,reqreboot=${RequiresReboot}i,alive=1i $TIMESTAMP"
 
 # Start assembling all lines into one variable
 LINES="$LINE_CPU
@@ -876,19 +769,17 @@ $LINE_LOAD
 $LINE_MEM
 $LINE_SYS"
 
-# Add network interfaces
+# Add network interfaces (rates were already averaged into RXBPS/TXBPS above)
 for NIC in "${NetworkInterfacesArray[@]}"; do
-  rx_bps=$(awk "BEGIN{printf \"%.0f\", ${tRX[$NIC]} / $X}")
-  tx_bps=$(awk "BEGIN{printf \"%.0f\", ${tTX[$NIC]} / $X}")
   LINES="$LINES
-network_stats,sid=$SID,host=$(hostname),interface=$NIC rx_bps=${rx_bps}i,tx_bps=${tx_bps}i $TIMESTAMP"
+network_stats,sid=$SID,host=$HOST,interface=$NIC rx_bps=${RXBPS[$NIC]:-0}i,tx_bps=${TXBPS[$NIC]:-0}i $TIMESTAMP"
 done
 
 # Add service statuses
 for SERVICE in "${!SRVCSR[@]}"; do
   STATUS="${SRVCSR[$SERVICE]}"
   LINES="$LINES
-service_status,sid=$SID,host=$(hostname),service=$SERVICE status=${STATUS}i $TIMESTAMP"
+service_status,sid=$SID,host=$HOST,service=$SERVICE status=${STATUS}i $TIMESTAMP"
 done
 
 # Add disk IOPS stats
@@ -896,7 +787,7 @@ for DISK in "${!IOPSRead[@]}"; do
   READ_BPS=${IOPSRead[$DISK]}
   WRITE_BPS=${IOPSWrite[$DISK]}
   LINES="$LINES
-disk_throughput,sid=$SID,host=$(hostname),mountpoint=$DISK,device=${vDISKs[$DISK]} read_bps=${READ_BPS}i,write_bps=${WRITE_BPS}i $TIMESTAMP"
+disk_throughput,sid=$SID,host=$HOST,mountpoint=$DISK,device=${vDISKs[$DISK]} read_bps=${READ_BPS}i,write_bps=${WRITE_BPS}i $TIMESTAMP"
 done
 
 # Add TRUE disk IOPS stats (ops/sec from operation counters)
@@ -905,7 +796,7 @@ for DISK in "${!IOPSReadOps[@]}"; do
   WRITE_IOPS=${IOPSWriteOps[$DISK]}
   TOTAL_IOPS=$(awk -v x="$READ_IOPS" -v y="$WRITE_IOPS" 'BEGIN{printf "%.2f", x+y}')
   LINES="$LINES
-disk_iops,sid=$SID,host=$(hostname),mountpoint=$DISK,device=${vDISKs[$DISK]} read_iops=$READ_IOPS,write_iops=$WRITE_IOPS,total_iops=$TOTAL_IOPS $TIMESTAMP"
+disk_iops,sid=$SID,host=$HOST,mountpoint=$DISK,device=${vDISKs[$DISK]} read_iops=$READ_IOPS,write_iops=$WRITE_IOPS,total_iops=$TOTAL_IOPS $TIMESTAMP"
 done
 
 # Add disk size & usage
@@ -914,23 +805,18 @@ for entry in "${DISKsArray[@]}"; do
   clean_entry="${entry%;}"
   IFS=',' read -r MNT FSTYPE TOTAL USED AVAIL <<< "$clean_entry"
   LINES="$LINES
-disk_size,sid=$SID,host=$(hostname),mountpoint=$MNT,fstype=$FSTYPE total_bytes=${TOTAL}i,used_bytes=${USED}i,avail_bytes=${AVAIL}i $TIMESTAMP"
-done
-
-# Add temperatures
-for SENSOR in "${!TempArray[@]}"; do
-  celsius=$(awk "BEGIN{printf \"%.1f\", ${TempArray[$SENSOR]} / ${TempArrayCnt[$SENSOR]} / 1000}")
-  SENSOR_CLEAN=$(echo "$SENSOR" | tr ' ' '_')
-  LINES="$LINES
-temperature,sid=$SID,host=$(hostname),sensor=$SENSOR_CLEAN celsius=$celsius $TIMESTAMP"
+disk_size,sid=$SID,host=$HOST,mountpoint=$MNT,fstype=$FSTYPE total_bytes=${TOTAL}i,used_bytes=${USED}i,avail_bytes=${AVAIL}i $TIMESTAMP"
 done
 
 # Print to console for debug
 echo "InfluxDB Line Protocol Payload (timestamp=$TIMESTAMP):"
 echo "$LINES"
 
-# Send line protocol to the gateway. 
-GW_HTTP_CODE=$(curl -s -o /tmp/ips1_gw_response.txt -w "%{http_code}" --max-time 15 \
+# Send line protocol to the gateway.
+# Use a private per-run temp file (not a fixed /tmp path) so a file left behind
+# by another user can never block or hijack the response capture.
+GW_RESPONSE_FILE=$(mktemp "${TMPDIR:-/tmp}/ips1_gw_response.XXXXXX") || GW_RESPONSE_FILE=/dev/null
+GW_HTTP_CODE=$(curl -s -o "$GW_RESPONSE_FILE" -w "%{http_code}" --max-time 15 \
   -XPOST "$GATEWAY_URL/v1/write" \
   -H "Authorization: Bearer $SERVER_TOKEN" \
   -H "Content-Type: text/plain; charset=utf-8" \
@@ -939,10 +825,16 @@ GW_HTTP_CODE=$(curl -s -o /tmp/ips1_gw_response.txt -w "%{http_code}" --max-time
 if [ "$GW_HTTP_CODE" = "204" ]; then
   echo "Metrics accepted by gateway."
 elif [ "$GW_HTTP_CODE" = "401" ]; then
-  echo "ERROR: gateway rejected SERVER_TOKEN (401). Re-run the installer to re-enroll."
-  if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Gateway 401, token rejected" >> "$ScriptPath"/debug.log; fi
+  # The gateway no longer recognizes this token (e.g. the server row was
+  # re-tokenized by a later enrollment, revoked, or lost to a DB reset). Self-heal
+  # by dropping the sealed credentials so the next timer tick re-enrolls and seals
+  # a fresh token — no manual reinstall needed. The gateway's live Nova check at
+  # enroll time remains the security boundary, so a deauthorized host stays out.
+  echo "ERROR: gateway rejected SERVER_TOKEN (401); dropping stale credentials to re-enroll on the next run."
+  if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Gateway 401, token rejected; resetting enrollment" >> "$ScriptPath"/debug.log; fi
+  reset_enrollment
 else
-  echo "ERROR: gateway returned HTTP $GW_HTTP_CODE: $(cat /tmp/ips1_gw_response.txt)"
-  if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Gateway HTTP $GW_HTTP_CODE: $(cat /tmp/ips1_gw_response.txt)" >> "$ScriptPath"/debug.log; fi
+  echo "ERROR: gateway returned HTTP $GW_HTTP_CODE: $(cat "$GW_RESPONSE_FILE")"
+  if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Gateway HTTP $GW_HTTP_CODE: $(cat "$GW_RESPONSE_FILE")" >> "$ScriptPath"/debug.log; fi
 fi
-rm -f /tmp/ips1_gw_response.txt
+rm -f "$GW_RESPONSE_FILE"
