@@ -33,6 +33,10 @@ ScriptPath=$(dirname "${BASH_SOURCE[0]}")
 # Agent Version (do not change)
 Version="0.1"
 
+# Every gateway call goes through nks-backend on psapi, which mounts the
+# gateway's routes under this prefix. GATEWAY_URL holds the host only.
+API_PREFIX="/api/v1/monitoring"
+
 # Load configuration file
 if [ -f "$ScriptPath"/ips1.cfg ]
 then
@@ -69,7 +73,7 @@ fi
 # enrollment and the sealed store we are about to delete is its only remaining
 # copy — without it a later tick could not reach the gateway to re-enroll.
 # Safe against a genuinely deauthorized instance: re-enrollment goes through
-# /v1/enroll, which the gateway verifies live against Nova and refuses if the
+# the enroll route, which the gateway verifies live against Nova and refuses if the
 # instance no longer qualifies, so this can never re-authorize a revoked host.
 reset_enrollment() {
 	if [ -n "$GATEWAY_URL" ]; then
@@ -143,7 +147,7 @@ then
 		echo "ERROR: could not read uuid/project_id from OpenStack metadata; cannot enroll." >&2
 		exit 1
 	fi
-	ENROLL_RESPONSE=$(curl -fsS --max-time 30 -XPOST "$GATEWAY_URL/v1/enroll" \
+	ENROLL_RESPONSE=$(curl -fsS --max-time 30 -XPOST "$GATEWAY_URL$API_PREFIX/enroll" \
 		-H "Content-Type: application/json" \
 		-d "{\"sid\":\"$SID\",\"project_id\":\"$PROJECT_ID\"}") || {
 		echo "Not yet authorized to enroll SID $SID (gateway rejected). Will retry next run." >&2
@@ -817,7 +821,7 @@ echo "$LINES"
 # by another user can never block or hijack the response capture.
 GW_RESPONSE_FILE=$(mktemp "${TMPDIR:-/tmp}/ips1_gw_response.XXXXXX") || GW_RESPONSE_FILE=/dev/null
 GW_HTTP_CODE=$(curl -s -o "$GW_RESPONSE_FILE" -w "%{http_code}" --max-time 15 \
-  -XPOST "$GATEWAY_URL/v1/write" \
+  -XPOST "$GATEWAY_URL$API_PREFIX/write" \
   -H "Authorization: Bearer $SERVER_TOKEN" \
   -H "Content-Type: text/plain; charset=utf-8" \
   --data-binary "$LINES")
