@@ -27,6 +27,10 @@ GITHUB_REPO="IPS1/novacloud-agent-monitoring"
 # Branch
 BRANCH="main"
 
+# nks-backend mounts the gateway's routes under this prefix on psapi.
+# IPS1_GATEWAY_URL holds the host only.
+API_PREFIX="/api/v1/monitoring"
+
 fetch_file() {   # fetch_file <url> <dest>
 	if command -v wget >/dev/null 2>&1; then
 		wget -t 1 -T 30 -qO "$2" "$1"
@@ -125,7 +129,7 @@ echo "... done."
 
 # Fetch the credential loader binary (pre-built, salt embedded at release time)
 echo "Fetching creds..."
-fetch_file "$IPS1_GATEWAY_URL/downloads/creds-linux-amd64" /usr/local/bin/creds
+fetch_file "$IPS1_GATEWAY_URL$API_PREFIX/downloads/creds-linux-amd64" /usr/local/bin/creds
 if [ ! -s /usr/local/bin/creds ]; then
 	echo "ERROR: creds download failed or produced an empty file. Check that the gateway server is reachable." >&2
 	exit 1
