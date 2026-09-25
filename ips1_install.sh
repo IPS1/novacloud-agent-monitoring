@@ -31,12 +31,32 @@ BRANCH="main"
 # IPS1_GATEWAY_URL holds the host only.
 API_PREFIX="/api/v1/monitoring"
 
-fetch_file() {   # fetch_file <url> <dest>
+# cloud-init runs this once, and a fresh VM can boot before its route to GitHub or
+# the gateway is up (firewall rule, DNS), so a download retries rather than failing.
+FETCH_ATTEMPTS="${IPS1_FETCH_ATTEMPTS:-10}"
+FETCH_RETRY_DELAY_SECS="${IPS1_FETCH_RETRY_DELAY_SECS:-15}"
+FETCH_TIMEOUT_SECS=30
+
+download_once() {   # download_once <url> <dest>
 	if command -v wget >/dev/null 2>&1; then
-		wget -t 1 -T 30 -qO "$2" "$1"
-	else
-		curl -fsSL --max-time 30 -o "$2" "$1"
+		wget -t 1 -T "$FETCH_TIMEOUT_SECS" -qO "$2" "$1"
+		return
 	fi
+	curl -fsSL --max-time "$FETCH_TIMEOUT_SECS" -o "$2" "$1"
+}
+
+fetch_file() {   # fetch_file <url> <dest>
+	local attempt
+	for attempt in $(seq 1 "$FETCH_ATTEMPTS"); do
+		download_once "$1" "$2" && return 0
+		# wget -O leaves an empty file behind on failure; don't let it pass as a download.
+		rm -f "$2"
+		[ "$attempt" -lt "$FETCH_ATTEMPTS" ] || break
+		echo "IPS1 installer: download of $1 failed (attempt $attempt/$FETCH_ATTEMPTS), retrying in ${FETCH_RETRY_DELAY_SECS}s..." >&2
+		sleep "$FETCH_RETRY_DELAY_SECS"
+	done
+	echo "IPS1 installer: ERROR: could not download $1 after $FETCH_ATTEMPTS attempts." >&2
+	return 1
 }
 
 # Validate gateway parameters from environment
