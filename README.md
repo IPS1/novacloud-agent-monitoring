@@ -42,6 +42,7 @@ Every minute the agent reports the following measurements to the dashboard.
 |--------|-------------|
 | Used | RAM in use (bytes) |
 | Free | RAM available (bytes) |
+| Swap | Swap total and in use (bytes) |
 
 ### Disk
 | Metric | Description |
@@ -49,11 +50,13 @@ Every minute the agent reports the following measurements to the dashboard.
 | Throughput | Read/write bytes per second, per device |
 | IOPS | Read/write/total operations per second, per device |
 | Capacity | Total, used, and available space per mount point (bytes) |
+| Inodes | Total, used, and free inodes per mount point |
 
 ### Network
 | Metric | Description |
 |--------|-------------|
 | Traffic | Received (RX) and transmitted (TX) bytes per second, per interface |
+| MAC address | The hardware address of each interface, which the dashboard uses to label it public or private |
 
 ### System
 | Metric | Description |
@@ -61,11 +64,21 @@ Every minute the agent reports the following measurements to the dashboard.
 | Uptime | Seconds since last boot |
 | Reboot required | Whether a pending reboot is flagged |
 | Alive | Heartbeat confirming the agent reported this minute |
+| Agent version | The version of this agent, so the dashboard can tell you when an update is available |
 
 ### Service health (optional)
 | Metric | Description |
 |--------|-------------|
 | Status | Up/down state of the services you chose to monitor |
+
+### Top processes (optional, on by default)
+| Metric | Description |
+|--------|-------------|
+| Top 5 by CPU / by memory | Process name, user, CPU %, memory %, resident memory, threads and PID |
+
+Only the process **name** is sent, never its command line, so an argument such as a
+password or a token never leaves your server. Turn the card off with
+`TopProcesses=0` in `/etc/ips1/ips1.cfg`.
 
 ## Verifying the Agent
 
