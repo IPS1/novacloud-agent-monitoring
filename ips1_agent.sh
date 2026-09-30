@@ -31,11 +31,31 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ScriptPath=$(dirname "${BASH_SOURCE[0]}")
 
 # Agent Version (do not change)
-Version="0.1"
+Version="0.2"
 
 # Every gateway call goes through nks-backend on psapi, which mounts the
 # gateway's routes under this prefix. GATEWAY_URL holds the host only.
 API_PREFIX="/api/v1/monitoring"
+
+# lp_string escapes a value for an InfluxDB line-protocol string field: a
+# backslash and a double quote are the only two characters that can end the
+# quoted value early, and a newline would start a whole new line of protocol.
+# Process and user names come from the machine's own process table, which a
+# customer controls, so nothing built from them may skip this.
+lp_string() {
+	printf '%s' "$1" | tr -d '\r\n' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# proc_cpu_jiffies prints "pid utime+stime" for every live process. The comm
+# field in /proc/PID/stat can contain spaces and parentheses, so the fields are
+# counted from after the LAST ") " rather than split across the whole line --
+# a process named "(a) b" would otherwise shift every column after it.
+proc_cpu_jiffies() {
+	awk 'match($0, /^[0-9]+ \(.*\) /) {
+		split(substr($0, RSTART + RLENGTH), f, " ")
+		print $1, f[12] + f[13]
+	}' /proc/[0-9]*/stat 2>/dev/null
+}
 
 # Load configuration file
 if [ -f "$ScriptPath"/ips1.cfg ]
@@ -44,6 +64,10 @@ then
 else
 	exit 1
 fi
+
+# TopProcesses may be missing from an ips1.cfg written before this version:
+# ips1_update.sh merges new keys in, but a run can happen before it does.
+TopProcesses="${TopProcesses:-1}"
 
 # Serialize agent runs. Two overlapping runs — a manual invocation racing the
 # systemd timer, a slow tick overlapping the next, or the self-heal reset racing
@@ -406,6 +430,17 @@ if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Collecting da
 # Memory totals cannot change between samples — read both once, in one pass
 read -r bRAM cRAM <<< "$(awk '/^MemTotal:/ {t=$2} /^SwapTotal:/ {s=$2} END{print t+0, s+0}' /proc/meminfo)"
 
+# First per-process CPU snapshot, paired with the second one taken after the
+# sampling loop below. ps's own %CPU is the process's LIFETIME average
+# (cputime/realtime), so it would rank a process that pegged a core at boot
+# above one that is pegging a core right now, and the number shown would
+# disagree with this same minute's CPU chart forever.
+PROC_JIF_BEFORE=""
+PROC_SAMPLE_START=$(date +%s)
+if [ "$TopProcesses" -gt 0 ]; then
+	PROC_JIF_BEFORE=$(proc_cpu_jiffies)
+fi
+
 # Initialize accumulators
 tCPU=0; tCPUwa=0; tCPUst=0; tCPUus=0; tCPUsy=0; tCPUidle=0; tCPUSpeed=0
 tloadavg1=0; tloadavg5=0; tloadavg15=0
@@ -484,13 +519,20 @@ do
 done
 
 # --- RAM used/free in BYTES for charts (one meminfo pass per minute) ---
-read -r MemTotalKB MemAvailKB MemFreeKB BuffersKB CachedKB SReclaimKB ShmemKB <<< \
-	"$(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} /^MemFree:/ {f=$2} /^Buffers:/ {b=$2} /^Cached:/ {c=$2} /^SReclaimable:/ {r=$2} /^Shmem:/ {m=$2} END{print t+0, a+0, f+0, b+0, c+0, r+0, m+0}' /proc/meminfo)"
+read -r MemTotalKB MemAvailKB MemFreeKB BuffersKB CachedKB SReclaimKB ShmemKB SwapTotalKB SwapFreeKB <<< \
+	"$(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} /^MemFree:/ {f=$2} /^Buffers:/ {b=$2} /^Cached:/ {c=$2} /^SReclaimable:/ {r=$2} /^Shmem:/ {m=$2} /^SwapTotal:/ {st=$2} /^SwapFree:/ {sf=$2} END{print t+0, a+0, f+0, b+0, c+0, r+0, m+0, st+0, sf+0}' /proc/meminfo)"
 if [ "$MemAvailKB" -eq 0 ]; then
   MemAvailKB=$(( MemFreeKB + BuffersKB + CachedKB + SReclaimKB - ShmemKB ))
 fi
 RAMUsedBytes=$(( (MemTotalKB - MemAvailKB) * 1024 ))
 RAMFreeBytes=$(( MemAvailKB * 1024 ))
+
+# --- Swap in BYTES, from the same meminfo pass as the RAM figures above. A VM
+# with no swap reports 0/0, which is the truth; an agent older than this one
+# reports neither field at all. ---
+SwapTotalBytes=$(( SwapTotalKB * 1024 ))
+SwapUsedBytes=$(( (SwapTotalKB - SwapFreeKB) * 1024 ))
+[ "$SwapUsedBytes" -ge 0 ] || SwapUsedBytes=0
 
 # Get user running the agent
 User=$(whoami)
@@ -593,7 +635,12 @@ if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CPU Model: $C
 
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) RAM Size: $RAMSize Usage: $RAM Swap Size: $RAMSwapSize Usage: $RAMSwap Buffers: $RAMBuff Cache: $RAMCache" >> "$ScriptPath"/debug.log; fi
 
-# Disks inodes
+# Disks inodes. The base64 blob below is the legacy payload; the array is what
+# the line protocol needs. -P keeps a long device name on one line, the same
+# reason the disk usage read above uses it.
+INODEsArray=()
+IFS=$'\n' read -d '' -r -a INODEsArray < <(timeout 3 df -TiP 2>/dev/null | sed 1d | grep -v -E 'tmpfs' | awk '{print $(NF)","$2","$3","$4","$5";"}')
+
 INODEs=$(echo -ne "$(timeout 3 df -Ti | sed 1d | grep -v -E 'tmpfs' | awk '{print $(NF)","$3","$4","$5";"}')" | tr -d '\n\r\t ' | base64 | tr -d '\n\r\t ')
 
 # Disks IOPS
@@ -671,8 +718,15 @@ IPv4=""
 IPv6=""
 declare -A RXBPS
 declare -A TXBPS
+declare -A NICMAC
 for NIC in "${NetworkInterfacesArray[@]}"
 do
+	# Reported as a field, never a tag: a new tag would change the identity of
+	# every existing network_stats series and break continuity at the update.
+	# cat, not a "< file" redirect: bash applies redirections left to right, so
+	# a NIC removed between enumeration and here would print to stderr before
+	# 2>/dev/null took effect -- one journal line per tick on a churning host.
+	NICMAC[$NIC]=$(cat /sys/class/net/"$NIC"/address 2>/dev/null | tr -d '\r\n')
 	# Individual NIC network usage, averaged over the X samples. Stored per
 	# NIC so the line-protocol assembly below reuses them without recomputing.
 	read -r RX TX <<< "$(awk -v rx="${tRX[$NIC]:-0}" -v tx="${tTX[$NIC]:-0}" -v x="$X" 'BEGIN{printf "%.0f %.0f", rx / x, tx / x}')"
@@ -749,6 +803,50 @@ then
 	# Save the current snapshot for next run
 	echo "$RPS2" > "$ScriptPath"/running_proc.txt
 fi
+# Top processes: the five heaviest by CPU and the five by memory.
+#
+# The process NAME (comm) is collected, never the command line: an argument can
+# carry a password or a token, and this leaves the VM. comm is read last on each
+# line so `read` keeps a name containing a space in one piece.
+#
+# CPU is the share of one core this process actually burned during this run --
+# the jiffies it gained between the two /proc snapshots, over the seconds
+# between them -- on the same 100%-is-one-core scale top and ps use. ps's own
+# %CPU column is a lifetime average and is deliberately not used.
+TOPPROC_CPU=""
+TOPPROC_MEM=""
+if [ "$TopProcesses" -gt 0 ]
+then
+	PROC_ELAPSED=$(( $(date +%s) - PROC_SAMPLE_START ))
+	[ "$PROC_ELAPSED" -gt 0 ] || PROC_ELAPSED=1
+	PROC_CLK=$(getconf CLK_TCK 2>/dev/null)
+	case "$PROC_CLK" in ''|*[!0-9]*) PROC_CLK=100 ;; esac
+
+	# Both snapshots and the ps table are joined in awk rather than a shell
+	# loop, so this stays one pass over a few hundred processes.
+	TOPPROC_ALL=$( { printf '%s\n' "$PROC_JIF_BEFORE"
+	                 echo "--"
+	                 proc_cpu_jiffies
+	                 echo "--"
+	                 timeout 3 ps -eo pid=,pmem=,rss=,nlwp=,user:32=,comm= 2>/dev/null
+	               } | awk -v clk="$PROC_CLK" -v el="$PROC_ELAPSED" '
+		$1 == "--" { stage++; next }
+		stage == 0 { before[$1] = $2; next }
+		stage == 1 { d = $2 - ($1 in before ? before[$1] : $2); if (d < 0) d = 0
+		             cpu[$1] = (d / clk) / el * 100; next }
+		NF >= 6 {
+			comm = $6
+			for (i = 7; i <= NF; i++) comm = comm " " $i
+			printf "%.1f %s %s %s %s %s %s\n", ($1 in cpu ? cpu[$1] : 0), $2, $3, $4, $1, $5, comm
+		}')
+	# A process that started during this run has no "before" row, so it is
+	# credited with nothing rather than its whole lifetime.
+	TOPPROC_CPU=$(printf '%s\n' "$TOPPROC_ALL" | sort -rn -k1,1 | head -n 5)
+	TOPPROC_MEM=$(printf '%s\n' "$TOPPROC_ALL" | sort -rn -k3,3 | head -n 5)
+fi
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Top by CPU: $(echo -ne "$TOPPROC_CPU" | tr '\n' ';')" >> "$ScriptPath"/debug.log; fi
+
 # Secured Connection
 if [ "$SecuredConnection" -gt 0 ]
 then
@@ -764,8 +862,8 @@ TIMESTAMP=$(date +%s)
 
 LINE_CPU="cpu_stats,sid=$SID,host=$HOST cpu=$CPU,idle=$CPUidle,wa=$CPUwa,st=$CPUst,us=$CPUus,sy=$CPUsy,cpuspeed=$CPUSpeed $TIMESTAMP"
 LINE_LOAD="load_stats,sid=$SID load1=$loadavg1,load5=$loadavg5,load15=$loadavg15 $TIMESTAMP"
-LINE_MEM="memory_stats,sid=$SID,host=$HOST ram_used_bytes=${RAMUsedBytes}i,ram_free_bytes=${RAMFreeBytes}i $TIMESTAMP"
-LINE_SYS="system_stats,sid=$SID,host=$HOST uptime=${Uptime}i,reqreboot=${RequiresReboot}i,alive=1i $TIMESTAMP"
+LINE_MEM="memory_stats,sid=$SID,host=$HOST ram_used_bytes=${RAMUsedBytes}i,ram_free_bytes=${RAMFreeBytes}i,swap_total_bytes=${SwapTotalBytes}i,swap_used_bytes=${SwapUsedBytes}i $TIMESTAMP"
+LINE_SYS="system_stats,sid=$SID,host=$HOST uptime=${Uptime}i,reqreboot=${RequiresReboot}i,alive=1i,agent_version=\"$(lp_string "$Version")\" $TIMESTAMP"
 
 # Start assembling all lines into one variable
 LINES="$LINE_CPU
@@ -775,8 +873,14 @@ $LINE_SYS"
 
 # Add network interfaces (rates were already averaged into RXBPS/TXBPS above)
 for NIC in "${NetworkInterfacesArray[@]}"; do
+  NIC_FIELDS="rx_bps=${RXBPS[$NIC]:-0}i,tx_bps=${TXBPS[$NIC]:-0}i"
+  # An interface with no readable address simply sends no mac field, which the
+  # gateway reads the same way it reads an agent that never sent one.
+  if [ -n "${NICMAC[$NIC]}" ]; then
+    NIC_FIELDS="$NIC_FIELDS,mac=\"$(lp_string "${NICMAC[$NIC]}")\""
+  fi
   LINES="$LINES
-network_stats,sid=$SID,host=$HOST,interface=$NIC rx_bps=${RXBPS[$NIC]:-0}i,tx_bps=${TXBPS[$NIC]:-0}i $TIMESTAMP"
+network_stats,sid=$SID,host=$HOST,interface=$NIC $NIC_FIELDS $TIMESTAMP"
 done
 
 # Add service statuses
@@ -808,9 +912,51 @@ for entry in "${DISKsArray[@]}"; do
   # strip any trailing semicolon from the CSV entry
   clean_entry="${entry%;}"
   IFS=',' read -r MNT FSTYPE TOTAL USED AVAIL <<< "$clean_entry"
+  # A mount point may legally contain a comma, which mis-splits this line and
+  # would send a non-number as a field value. InfluxDB rejects the whole gzip
+  # batch on one malformed line, so a guard here protects every other line in
+  # it -- the same guard the inode loop below carries.
+  case "$TOTAL$USED$AVAIL" in
+    ''|*[!0-9]*) continue ;;
+  esac
   LINES="$LINES
 disk_size,sid=$SID,host=$HOST,mountpoint=$MNT,fstype=$FSTYPE total_bytes=${TOTAL}i,used_bytes=${USED}i,avail_bytes=${AVAIL}i $TIMESTAMP"
 done
+
+# Add disk inodes. A filesystem that does not count inodes (btrfs, zfs) reports
+# "-" for all three, which is not a number, so it is skipped rather than sent.
+for entry in "${INODEsArray[@]}"; do
+  clean_entry="${entry%;}"
+  IFS=',' read -r IMNT IFSTYPE ITOTAL IUSED IFREE <<< "$clean_entry"
+  case "$ITOTAL$IUSED$IFREE" in
+    ''|*[!0-9]*) continue ;;
+  esac
+  LINES="$LINES
+disk_inodes,sid=$SID,host=$HOST,mountpoint=$IMNT,fstype=$IFSTYPE total=${ITOTAL}i,used=${IUSED}i,free=${IFREE}i $TIMESTAMP"
+done
+
+# Add the top processes. by and rank are tags, so this is at most ten series per
+# instance whatever the VM runs; the name is a field, because a process name as
+# a tag would make series identity unbounded.
+add_process_lines() {
+  local by="$1" data="$2" rank=0
+  local pcpu pmem rss nlwp pid user comm
+  [ -n "$data" ] || return 0
+  while IFS= read -r proc_line; do
+    [ -n "$proc_line" ] || continue
+    read -r pcpu pmem rss nlwp pid user comm <<< "$proc_line"
+    # A row without a name would render as a blank line in the customer's page.
+    [ -n "$comm" ] || continue
+    case "$rss$nlwp$pid" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    rank=$(( rank + 1 ))
+    LINES="$LINES
+process_stats,sid=$SID,host=$HOST,by=$by,rank=$rank name=\"$(lp_string "$comm")\",user=\"$(lp_string "$user")\",cpu=${pcpu:-0},mem=${pmem:-0},rss_bytes=$(( rss * 1024 ))i,threads=${nlwp}i,pid=${pid}i $TIMESTAMP"
+  done <<< "$data"
+}
+add_process_lines "cpu" "$TOPPROC_CPU"
+add_process_lines "mem" "$TOPPROC_MEM"
 
 # Print to console for debug
 echo "InfluxDB Line Protocol Payload (timestamp=$TIMESTAMP):"
